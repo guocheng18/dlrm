@@ -117,6 +117,8 @@ with warnings.catch_warnings():
 # import torch.nn.functional as Functional
 # from torch.nn.parameter import Parameter
 
+from selection_networks import EdimQbitSelectionNetwork
+
 exc = getattr(builtins, "IOError", "FileNotFoundError")
 
 
@@ -314,6 +316,10 @@ class DLRM_Net(nn.Module):
         md_threshold=200,
         weighted_pooling=None,
         loss_function="bce",
+        dyedims_flag=False,
+        dyedims_options=None,
+        dyqbits_flag=False,
+        dyqbits_options=None,
     ):
         super(DLRM_Net, self).__init__()
 
@@ -335,6 +341,10 @@ class DLRM_Net(nn.Module):
             self.sync_dense_params = sync_dense_params
             self.loss_threshold = loss_threshold
             self.loss_function = loss_function
+            self.dyedims_flag = dyedims_flag
+            self.dyedims_options = dyedims_options
+            self.dyqbits_flag = dyqbits_flag
+            self.dyqbits_options = dyqbits_options
             if weighted_pooling is not None and weighted_pooling != "fixed":
                 self.weighted_pooling = "learned"
             else:
@@ -374,6 +384,8 @@ class DLRM_Net(nn.Module):
                         self.v_W_l.append(Parameter(w))
                 else:
                     self.v_W_l = w_list
+                if self.dyedims_flag or self.dyqbits_flag:
+                    self.selector = EdimQbitSelectionNetwork(m_spa, 2*m_spa, len(self.dyedims_options), len(self.dyqbits_options))
             self.bot_l = self.create_mlp(ln_bot, sigmoid_bot)
             self.top_l = self.create_mlp(ln_top, sigmoid_top)
 
@@ -588,6 +600,12 @@ class DLRM_Net(nn.Module):
         return z
 
     def sequential_forward(self, dense_x, lS_o, lS_i):
+        # batch size
+        b = dense_x.size(0)
+
+        # total sparse features
+        n_spa = lS_i.size(0)
+
         # process dense features (using bottom mlp), resulting in a row vector
         x = self.apply_mlp(dense_x, self.bot_l)
         # debug prints
@@ -598,6 +616,25 @@ class DLRM_Net(nn.Module):
         ly = self.apply_emb(lS_o, lS_i, self.emb_l, self.v_W_l)
         # for y in ly:
         #     print(y.detach().cpu().numpy())
+
+        # New: reduce dimensions of embeddings
+        avg_dims = None
+        if self.dyedims_flag:
+            ly_s = torch.cat(ly, dim=0)
+            reduced_dims, _ = self.selector(ly_s)
+
+            values = reduced_dims @ torch.tensor(self.dyedims_options, device=reduced_dims.device).float()
+            mask = torch.arange(max(self.dyedims_options), device=ly_s.device).unsqueeze(0) < values.unsqueeze(1)
+            reduced_ly_s = ly_s * mask
+
+            ly = list(reduced_ly_s.split(b, dim=0))
+            avg_dims = values.sum() / b / n_spa
+
+        # New: reduce quantization bits of embeddings
+        avg_bits = None
+        if self.dyqbits_flag:
+            pass
+
 
         # interact features (dense and sparse)
         z = self.interact_features(x, ly)
@@ -612,7 +649,7 @@ class DLRM_Net(nn.Module):
         else:
             z = p
 
-        return z
+        return z, avg_dims, avg_bits
 
     def parallel_forward(self, dense_x, lS_o, lS_i):
         ### prepare model (overwrite) ###
@@ -758,6 +795,35 @@ def dash_separated_floats(value):
 
     return value
 
+def calculateCompressionRate(args, dlrm, log_iter=-1):
+    #1. Get the selector network from DLRM
+    selector = dlrm.selector
+
+    #2. Fetch all 26 embedding tables
+    emb_list = dlrm.emb_l
+
+    #3. Feed all embeddings to selector and get back results
+    dim_count = np.zeros(len(args.dyedims_options))
+    bit_count = np.zeros(len(args.dyqbits_options))
+    for emb_module in emb_list:
+        embs = emb_module.weight.data
+        dim_decs, bit_decs = selector(embs)
+        dim_count += dim_decs.sum(0).detach().cpu().numpy()
+        bit_count += bit_decs.sum(0).detach().cpu().numpy()
+
+    #4. Calculate compression rate
+    dim_compression_rate = np.array(args.dyedims_options).dot(dim_count) / (max(args.dyedims_options) * dim_count.sum())
+    bit_compression_rate = np.array(args.dyqbits_options).dot(bit_count) / (max(args.dyqbits_options) * bit_count.sum())
+
+    writer.add_scalar("Test/DimCompressionRate", dim_compression_rate, log_iter)
+    writer.add_scalar("Test/BitCompressionRate", bit_compression_rate, log_iter)
+
+    print(" dim compression rate {:3.3f} %, bit compression rate {:3.3f} %".format(
+            dim_compression_rate * 100, bit_compression_rate * 100
+        ),
+        flush=True,
+    )
+    return dim_compression_rate, bit_compression_rate
 
 def inference(
     args,
@@ -791,7 +857,7 @@ def inference(
             continue
 
         # forward pass
-        Z_test = dlrm_wrap(
+        Z_test, _, _ = dlrm_wrap(
             X_test,
             lS_o_test,
             lS_i_test,
@@ -1023,11 +1089,27 @@ def run():
     parser.add_argument("--lr-decay-start-step", type=int, default=0)
     parser.add_argument("--lr-num-decay-steps", type=int, default=0)
 
+    # Dynamic embedding dimensions
+    parser.add_argument("--dyedims-flag", action="store_true", default=False)
+    parser.add_argument("--dyedims-options", type=str, default="2,1")
+    parser.add_argument("--dyedims-loss-temp", type=float, default=1.0)
+
+    # Dynamic quantization bits
+    parser.add_argument("--dyqbits-flag", action="store_true", default=False)
+    parser.add_argument("--dyqbits-options", type=str, default="32,16,8")
+    parser.add_argument("--dyqbits-loss-temp", type=float, default=1.0)
+
+    parser.add_argument("--lr-selector", type=float, default=0.01)
+    parser.add_argument("--load-model-v2", type=str, default="")
+
     global args
     global nbatches
     global nbatches_test
     global writer
     args = parser.parse_args()
+
+    args.dyedims_options = list(map(int, args.dyedims_options.split(",")))
+    args.dyqbits_options = list(map(int, args.dyqbits_options.split(",")))
 
     if args.dataset_multiprocessing:
         assert sys.version_info[0] >= 3 and sys.version_info[1] > 7, (
@@ -1305,6 +1387,10 @@ def run():
         md_threshold=args.md_threshold,
         weighted_pooling=args.weighted_pooling,
         loss_function=args.loss_function,
+        dyedims_flag=args.dyedims_flag,
+        dyedims_options=args.dyedims_options,
+        dyqbits_flag=args.dyqbits_flag,
+        dyqbits_options=args.dyqbits_options,
     )
 
     # test prints
@@ -1386,6 +1472,8 @@ def run():
     skip_upto_batch = 0
     total_time = 0
     total_loss = 0
+    total_dyedims_loss = 0
+    total_dyqbits_loss = 0
     total_iter = 0
     total_samp = 0
 
@@ -1457,6 +1545,32 @@ def run():
             )
         else:
             print("Testing state: accuracy = {:3.3f} %".format(ld_acc_test * 100))
+
+    # Load model v2 is specified
+    if not (args.load_model_v2 == ""):
+        print("Loading saved model v2 {}".format(args.load_model_v2))
+        if use_gpu:
+            if dlrm.ndevices > 1:
+                # NOTE: when targeting inference on multiple GPUs,
+                # load the model as is on CPU or GPU, with the move
+                # to multiple GPUs to be done in parallel_forward
+                ld_model = torch.load(args.load_model_v2)
+            else:
+                # NOTE: when targeting inference on single GPU,
+                # note that the call to .to(device) has already happened
+                ld_model = torch.load(
+                    args.load_model_v2,
+                    map_location=torch.device("cuda"),
+                    # map_location=lambda storage, loc: storage.cuda(0)
+                )
+        else:
+            # when targeting inference on CPU
+            ld_model = torch.load(args.load_model_v2, map_location=torch.device("cpu"))
+        dlrm.load_state_dict(ld_model["state_dict"], strict=False)
+        # Freeze weights with parameter names starting with "emb"
+        for name, param in dlrm.named_parameters():
+            if name.startswith("emb"):
+                param.requires_grad = False
 
     if args.inference_only:
         # Currently only dynamic quantization with INT8 and FP16 weights are
@@ -1575,7 +1689,7 @@ def run():
                     mbs = T.shape[0]  # = args.mini_batch_size except maybe for last
 
                     # forward pass
-                    Z = dlrm_wrap(
+                    Z, avg_dims, avg_bits = dlrm_wrap(
                         X,
                         lS_o,
                         lS_i,
@@ -1590,9 +1704,17 @@ def run():
 
                     # loss
                     E = loss_fn_wrap(Z, T, use_gpu, device)
+                    if args.dyedims_flag:
+                        E += args.dyedims_loss_temp * avg_dims
+                    if args.dyqbits_flag:
+                        E += args.dyqbits_loss_temp * avg_bits
 
                     # compute loss and accuracy
                     L = E.detach().cpu().numpy()  # numpy array
+                    if args.dyedims_flag:
+                        L1 = (args.dyedims_loss_temp * avg_dims).detach().cpu().numpy()
+                    if args.dyqbits_flag:
+                        L2 = (args.dyqbits_loss_temp * avg_bits).detach().cpu().numpy()
                     # training accuracy is not disabled
                     # S = Z.detach().cpu().numpy()  # numpy array
                     # T = T.detach().cpu().numpy()  # numpy array
@@ -1630,6 +1752,10 @@ def run():
                         total_time += t2 - t1
 
                     total_loss += L * mbs
+                    if args.dyedims_flag:
+                        total_dyedims_loss += L1 * mbs
+                    if args.dyqbits_flag:
+                        total_dyqbits_loss += L2 * mbs
                     total_iter += 1
                     total_samp += mbs
 
@@ -1648,7 +1774,11 @@ def run():
                         total_time = 0
 
                         train_loss = total_loss / total_samp
+                        train_dyedims_loss = total_dyedims_loss / total_samp
+                        train_dyqbits_loss = total_dyqbits_loss / total_samp
                         total_loss = 0
+                        total_dyedims_loss = 0
+                        total_dyqbits_loss = 0
 
                         str_run_type = (
                             "inference" if args.inference_only else "training"
@@ -1662,13 +1792,23 @@ def run():
                             "Finished {} it {}/{} of epoch {}, {:.2f} ms/it,".format(
                                 str_run_type, j + 1, nbatches, k, gT
                             )
-                            + " loss {:.6f}".format(train_loss)
+                            + " loss {:.6f},".format(train_loss)
+                            + " dyedims loss {:.6f}".format(train_dyedims_loss)
+                            + " dyqbits loss {:.6f}".format(train_dyqbits_loss)
                             + wall_time,
                             flush=True,
                         )
 
                         log_iter = nbatches * k + j + 1
                         writer.add_scalar("Train/Loss", train_loss, log_iter)
+                        if args.dyedims_flag:
+                            writer.add_scalar("Train/DyEDimsLoss", train_dyedims_loss, log_iter)
+                        if args.dyqbits_flag:
+                            writer.add_scalar("Train/DyQBitsLoss", train_dyqbits_loss, log_iter)
+
+                        # for name, param in dlrm.selector.named_parameters():
+                        #     if param.grad is not None:
+                        #         writer.add_histogram(f"{name}.grad", param.grad, log_iter)
 
                         total_iter = 0
                         total_samp = 0
@@ -1701,6 +1841,15 @@ def run():
                             use_gpu,
                             log_iter,
                         )
+                        if is_best:
+                            if args.mlperf_logging:
+                                best_auc_test = model_metrics_dict["test_auc"]
+                            else:
+                                best_acc_test = model_metrics_dict["test_acc"]
+
+                        # Calculate the overall compression rate
+                        if args.dyedims_flag or args.dyqbits_flag:
+                            calculateCompressionRate(args, dlrm, log_iter)
 
                         if (
                             is_best
@@ -1714,8 +1863,8 @@ def run():
                             model_metrics_dict["opt_state_dict"] = (
                                 optimizer.state_dict()
                             )
-                            print("Saving model to {}".format(args.save_model))
-                            torch.save(model_metrics_dict, args.save_model)
+                            print("Saving model to {}".format(args.save_model+".epoch{}.iter{}".format(k, j+1)))
+                            torch.save(model_metrics_dict, args.save_model+".epoch{}.iter{}".format(k, j+1))
 
                         if args.mlperf_logging:
                             mlperf_logger.barrier()
