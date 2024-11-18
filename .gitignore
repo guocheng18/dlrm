@@ -136,3 +136,10 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+
+# Data
+*.npz
+
+tensorboard_dac/
+checkpoints_dac/
+.vscode/
