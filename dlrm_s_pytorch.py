@@ -51,37 +51,34 @@
 # Misha Smelyanskiy, "Deep Learning Recommendation Model for Personalization and
 # Recommendation Systems", CoRR, arXiv:1906.00091, 2019
 
-from __future__ import absolute_import, division, print_function, unicode_literals
+from __future__ import (absolute_import, division, print_function,
+                        unicode_literals)
 
 import argparse
-
 # miscellaneous
 import builtins
 import datetime
 import json
 import sys
 import time
-
 # onnx
 # The onnx import causes deprecation warnings every time workers
 # are spawned during testing. So, we filter out those warnings.
 import warnings
 
-# data generation
-import dlrm_data_pytorch as dp
-
-# For distributed run
-import extend_distributed as ext_dist
-import mlperf_logger
-
 # numpy
 import numpy as np
-import optim.rwsadagrad as RowWiseSparseAdagrad
 import sklearn.metrics
-
 # pytorch
 import torch
 import torch.nn as nn
+
+# data generation
+import dlrm_data_pytorch as dp
+# For distributed run
+import extend_distributed as ext_dist
+import mlperf_logger
+import optim.rwsadagrad as RowWiseSparseAdagrad
 
 # dataloader
 try:
@@ -101,8 +98,7 @@ from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.tensorboard import SummaryWriter
 
 # mixed-dimension trick
-from tricks.md_embedding_bag import md_solver, PrEmbeddingBag
-
+from tricks.md_embedding_bag import PrEmbeddingBag, md_solver
 # quotient-remainder trick
 from tricks.qr_embedding_bag import QREmbeddingBag
 
@@ -117,6 +113,7 @@ with warnings.catch_warnings():
 # import torch.nn.functional as Functional
 # from torch.nn.parameter import Parameter
 
+from quantizations import FP8QuantDequantSTE, FP16QuantDequantSTE
 from selection_networks import EdimQbitSelectionNetwork
 
 exc = getattr(builtins, "IOError", "FileNotFoundError")
@@ -633,8 +630,17 @@ class DLRM_Net(nn.Module):
         # New: reduce quantization bits of embeddings
         avg_bits = None
         if self.dyqbits_flag:
-            pass
-
+            ly_s = torch.cat(ly, dim=0)
+            _, reduced_bits = self.selector(ly_s)  # reduced_bits: [n_embeds, n_options], one-hot matrix
+            # FP32
+            ly_s_fp32 = ly_s * reduced_bits[:, 0].unsqueeze(1)
+            # FP16
+            ly_s_fp16 = FP16QuantDequantSTE(ly_s * reduced_bits[:, 1].unsqueeze(1))
+            # FP8
+            ly_s_fp8 = FP8QuantDequantSTE(ly_s * reduced_bits[:, 2].unsqueeze(1))
+            quantized_ly_s = ly_s_fp32 + ly_s_fp16 + ly_s_fp8
+            ly = list(quantized_ly_s.split(b, dim=0))
+            avg_bits = (reduced_bits[:, 0].sum() * 32 + reduced_bits[:, 1].sum() * 16 + reduced_bits[:, 2].sum() * 8) / b / n_spa
 
         # interact features (dense and sparse)
         z = self.interact_features(x, ly)
