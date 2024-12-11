@@ -1,74 +1,17 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-#
-# This source code is licensed under the MIT license found in the
-# LICENSE file in the root directory of this source tree.
-
-# Description: an implementation of a deep learning recommendation model (DLRM)
-# The model input consists of dense and sparse features. The former is a vector
-# of floating point values. The latter is a list of sparse indices into
-# embedding tables, which consist of vectors of floating point values.
-# The selected vectors are passed to mlp networks denoted by triangles,
-# in some cases the vectors are interacted through operators (Ops).
-#
-# output:
-#                         vector of values
-# model:                        |
-#                              /\
-#                             /__\
-#                               |
-#       _____________________> Op  <___________________
-#     /                         |                      \
-#    /\                        /\                      /\
-#   /__\                      /__\           ...      /__\
-#    |                          |                       |
-#    |                         Op                      Op
-#    |                    ____/__\_____           ____/__\____
-#    |                   |_Emb_|____|__|    ...  |_Emb_|__|___|
-# input:
-# [ dense features ]     [sparse indices] , ..., [sparse indices]
-#
-# More precise definition of model layers:
-# 1) fully connected layers of an mlp
-# z = f(y)
-# y = Wx + b
-#
-# 2) embedding lookup (for a list of sparse indices p=[p1,...,pk])
-# z = Op(e1,...,ek)
-# obtain vectors e1=E[:,p1], ..., ek=E[:,pk]
-#
-# 3) Operator Op can be one of the following
-# Sum(e1,...,ek) = e1 + ... + ek
-# Dot(e1,...,ek) = [e1'e1, ..., e1'ek, ..., ek'e1, ..., ek'ek]
-# Cat(e1,...,ek) = [e1', ..., ek']'
-# where ' denotes transpose operation
-#
-# References:
-# [1] Maxim Naumov, Dheevatsa Mudigere, Hao-Jun Michael Shi, Jianyu Huang,
-# Narayanan Sundaram, Jongsoo Park, Xiaodong Wang, Udit Gupta, Carole-Jean Wu,
-# Alisson G. Azzolini, Dmytro Dzhulgakov, Andrey Mallevich, Ilia Cherniavskii,
-# Yinghai Lu, Raghuraman Krishnamoorthi, Ansha Yu, Volodymyr Kondratenko,
-# Stephanie Pereira, Xianjie Chen, Wenlin Chen, Vijay Rao, Bill Jia, Liang Xiong,
-# Misha Smelyanskiy, "Deep Learning Recommendation Model for Personalization and
-# Recommendation Systems", CoRR, arXiv:1906.00091, 2019
-
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
 import argparse
 # miscellaneous
 import builtins
-import datetime
-import json
 import sys
 import time
 # onnx
 # The onnx import causes deprecation warnings every time workers
 # are spawned during testing. So, we filter out those warnings.
-import warnings
 
 # numpy
 import numpy as np
-import sklearn.metrics
 # pytorch
 import torch
 import torch.nn as nn
@@ -77,7 +20,6 @@ import torch.nn as nn
 import dlrm_data_pytorch as dp
 # For distributed run
 import extend_distributed as ext_dist
-import mlperf_logger
 import optim.rwsadagrad as RowWiseSparseAdagrad
 
 # dataloader
@@ -90,9 +32,6 @@ except ImportError:
 
 from torch._ops import ops
 from torch.autograd.profiler import record_function
-from torch.nn.parallel.parallel_apply import parallel_apply
-from torch.nn.parallel.replicate import replicate
-from torch.nn.parallel.scatter_gather import gather, scatter
 from torch.nn.parameter import Parameter
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.tensorboard import SummaryWriter
@@ -101,13 +40,6 @@ from torch.utils.tensorboard import SummaryWriter
 from tricks.md_embedding_bag import PrEmbeddingBag, md_solver
 # quotient-remainder trick
 from tricks.qr_embedding_bag import QREmbeddingBag
-
-with warnings.catch_warnings():
-    warnings.filterwarnings("ignore", category=DeprecationWarning)
-    try:
-        import onnx
-    except ImportError as error:
-        print("Unable to import onnx. ", error)
 
 # from torchviz import make_dot
 # import torch.nn.functional as Functional
@@ -248,49 +180,36 @@ class DLRM_Net(nn.Module):
         emb_l = nn.ModuleList()
         v_W_l = []
         for i in range(0, ln.size):
-            if ext_dist.my_size > 1:
-                if i not in self.local_emb_indices:
-                    continue
             n = ln[i]
-
-            # construct embedding operator
-            if self.qr_flag and n > self.qr_threshold:
-                EE = QREmbeddingBag(
-                    n,
-                    m,
-                    self.qr_collisions,
-                    operation=self.qr_operation,
-                    mode="sum",
-                    sparse=True,
-                )
-            elif self.md_flag and n > self.md_threshold:
-                base = max(m)
-                _m = m[i] if n > self.md_threshold else base
-                EE = PrEmbeddingBag(n, _m, base)
-                # use np initialization as below for consistency...
-                W = np.random.uniform(
-                    low=-np.sqrt(1 / n), high=np.sqrt(1 / n), size=(n, _m)
-                ).astype(np.float32)
-                EE.embs.weight.data = torch.tensor(W, requires_grad=True)
-            else:
-                EE = nn.EmbeddingBag(n, m, mode="sum", sparse=True)
-                # initialize embeddings
-                # nn.init.uniform_(EE.weight, a=-np.sqrt(1 / n), b=np.sqrt(1 / n))
-                W = np.random.uniform(
-                    low=-np.sqrt(1 / n), high=np.sqrt(1 / n), size=(n, m)
-                ).astype(np.float32)
-                # approach 1
-                EE.weight.data = torch.tensor(W, requires_grad=True)
-                # approach 2
-                # EE.weight.data.copy_(torch.tensor(W))
-                # approach 3
-                # EE.weight = Parameter(torch.tensor(W),requires_grad=True)
+            EE = nn.EmbeddingBag(n, m, mode="sum", sparse=True)
+            # initialize embeddings
+            # nn.init.uniform_(EE.weight, a=-np.sqrt(1 / n), b=np.sqrt(1 / n))
+            W = np.random.uniform(
+                low=-np.sqrt(1 / n), high=np.sqrt(1 / n), size=(n, m)
+            ).astype(np.float32)
+            # approach 1
+            EE.weight.data = torch.tensor(W, requires_grad=True)
+            # approach 2
+            # EE.weight.data.copy_(torch.tensor(W))
+            # approach 3
+            # EE.weight = Parameter(torch.tensor(W),requires_grad=True)
             if weighted_pooling is None:
                 v_W_l.append(None)
             else:
                 v_W_l.append(torch.ones(n, dtype=torch.float32))
             emb_l.append(EE)
         return emb_l, v_W_l
+
+    def create_bare_emb(self, m, ln, weighted_pooling=None, dtype=torch.float32):
+        emb_l = nn.ParameterList()
+        for i in range(0, ln.size):
+            n = ln[i]
+            W = np.random.uniform(
+                low=-np.sqrt(1 / n), high=np.sqrt(1 / n), size=(n, m)
+            ).astype(np.float32)
+            E = nn.Parameter(torch.tensor(W).to(dtype), requires_grad=True)
+            emb_l.append(E)
+        return emb_l
 
     def __init__(
         self,
@@ -537,65 +456,6 @@ class DLRM_Net(nn.Module):
             # single-node multi-device run
             return self.parallel_forward(dense_x, lS_o, lS_i)
 
-    def distributed_forward(self, dense_x, lS_o, lS_i):
-        batch_size = dense_x.size()[0]
-        # WARNING: # of ranks must be <= batch size in distributed_forward call
-        if batch_size < ext_dist.my_size:
-            sys.exit(
-                "ERROR: batch_size (%d) must be larger than number of ranks (%d)"
-                % (batch_size, ext_dist.my_size)
-            )
-        if batch_size % ext_dist.my_size != 0:
-            sys.exit(
-                "ERROR: batch_size %d can not split across %d ranks evenly"
-                % (batch_size, ext_dist.my_size)
-            )
-
-        dense_x = dense_x[ext_dist.get_my_slice(batch_size)]
-        lS_o = lS_o[self.local_emb_slice]
-        lS_i = lS_i[self.local_emb_slice]
-
-        if (len(self.emb_l) != len(lS_o)) or (len(self.emb_l) != len(lS_i)):
-            sys.exit(
-                "ERROR: corrupted model input detected in distributed_forward call"
-            )
-
-        # embeddings
-        with record_function("DLRM embedding forward"):
-            ly = self.apply_emb(lS_o, lS_i, self.emb_l, self.v_W_l)
-
-        # WARNING: Note that at this point we have the result of the embedding lookup
-        # for the entire batch on each rank. We would like to obtain partial results
-        # corresponding to all embedding lookups, but part of the batch on each rank.
-        # Therefore, matching the distribution of output of bottom mlp, so that both
-        # could be used for subsequent interactions on each device.
-        if len(self.emb_l) != len(ly):
-            sys.exit("ERROR: corrupted intermediate result in distributed_forward call")
-
-        a2a_req = ext_dist.alltoall(ly, self.n_emb_per_rank)
-
-        with record_function("DLRM bottom nlp forward"):
-            x = self.apply_mlp(dense_x, self.bot_l)
-
-        ly = a2a_req.wait()
-        ly = list(ly)
-
-        # interactions
-        with record_function("DLRM interaction forward"):
-            z = self.interact_features(x, ly)
-
-        # top mlp
-        with record_function("DLRM top nlp forward"):
-            p = self.apply_mlp(z, self.top_l)
-
-        # clamp output if needed
-        if 0.0 < self.loss_threshold and self.loss_threshold < 1.0:
-            z = torch.clamp(p, min=self.loss_threshold, max=(1.0 - self.loss_threshold))
-        else:
-            z = p
-
-        return z
-
     def sequential_forward(self, dense_x, lS_o, lS_i):
         # batch size
         b = dense_x.size(0)
@@ -657,124 +517,6 @@ class DLRM_Net(nn.Module):
 
         return z, avg_dims, avg_bits
 
-    def parallel_forward(self, dense_x, lS_o, lS_i):
-        ### prepare model (overwrite) ###
-        # WARNING: # of devices must be >= batch size in parallel_forward call
-        batch_size = dense_x.size()[0]
-        ndevices = min(self.ndevices, batch_size, len(self.emb_l))
-        device_ids = range(ndevices)
-        # WARNING: must redistribute the model if mini-batch size changes(this is common
-        # for last mini-batch, when # of elements in the dataset/batch size is not even
-        if self.parallel_model_batch_size != batch_size:
-            self.parallel_model_is_not_prepared = True
-
-        if self.parallel_model_is_not_prepared or self.sync_dense_params:
-            # replicate mlp (data parallelism)
-            self.bot_l_replicas = replicate(self.bot_l, device_ids)
-            self.top_l_replicas = replicate(self.top_l, device_ids)
-            self.parallel_model_batch_size = batch_size
-
-        if self.parallel_model_is_not_prepared:
-            # distribute embeddings (model parallelism)
-            t_list = []
-            w_list = []
-            for k, emb in enumerate(self.emb_l):
-                d = torch.device("cuda:" + str(k % ndevices))
-                t_list.append(emb.to(d))
-                if self.weighted_pooling == "learned":
-                    w_list.append(Parameter(self.v_W_l[k].to(d)))
-                elif self.weighted_pooling == "fixed":
-                    w_list.append(self.v_W_l[k].to(d))
-                else:
-                    w_list.append(None)
-            self.emb_l = nn.ModuleList(t_list)
-            if self.weighted_pooling == "learned":
-                self.v_W_l = nn.ParameterList(w_list)
-            else:
-                self.v_W_l = w_list
-            self.parallel_model_is_not_prepared = False
-
-        ### prepare input (overwrite) ###
-        # scatter dense features (data parallelism)
-        # print(dense_x.device)
-        dense_x = scatter(dense_x, device_ids, dim=0)
-        # distribute sparse features (model parallelism)
-        if (len(self.emb_l) != len(lS_o)) or (len(self.emb_l) != len(lS_i)):
-            sys.exit("ERROR: corrupted model input detected in parallel_forward call")
-
-        t_list = []
-        i_list = []
-        for k, _ in enumerate(self.emb_l):
-            d = torch.device("cuda:" + str(k % ndevices))
-            t_list.append(lS_o[k].to(d))
-            i_list.append(lS_i[k].to(d))
-        lS_o = t_list
-        lS_i = i_list
-
-        ### compute results in parallel ###
-        # bottom mlp
-        # WARNING: Note that the self.bot_l is a list of bottom mlp modules
-        # that have been replicated across devices, while dense_x is a tuple of dense
-        # inputs that has been scattered across devices on the first (batch) dimension.
-        # The output is a list of tensors scattered across devices according to the
-        # distribution of dense_x.
-        x = parallel_apply(self.bot_l_replicas, dense_x, None, device_ids)
-        # debug prints
-        # print(x)
-
-        # embeddings
-        ly = self.apply_emb(lS_o, lS_i, self.emb_l, self.v_W_l)
-        # debug prints
-        # print(ly)
-
-        # butterfly shuffle (implemented inefficiently for now)
-        # WARNING: Note that at this point we have the result of the embedding lookup
-        # for the entire batch on each device. We would like to obtain partial results
-        # corresponding to all embedding lookups, but part of the batch on each device.
-        # Therefore, matching the distribution of output of bottom mlp, so that both
-        # could be used for subsequent interactions on each device.
-        if len(self.emb_l) != len(ly):
-            sys.exit("ERROR: corrupted intermediate result in parallel_forward call")
-
-        t_list = []
-        for k, _ in enumerate(self.emb_l):
-            d = torch.device("cuda:" + str(k % ndevices))
-            y = scatter(ly[k], device_ids, dim=0)
-            t_list.append(y)
-        # adjust the list to be ordered per device
-        ly = list(map(lambda y: list(y), zip(*t_list)))
-        # debug prints
-        # print(ly)
-
-        # interactions
-        z = []
-        for k in range(ndevices):
-            zk = self.interact_features(x[k], ly[k])
-            z.append(zk)
-        # debug prints
-        # print(z)
-
-        # top mlp
-        # WARNING: Note that the self.top_l is a list of top mlp modules that
-        # have been replicated across devices, while z is a list of interaction results
-        # that by construction are scattered across devices on the first (batch) dim.
-        # The output is a list of tensors scattered across devices according to the
-        # distribution of z.
-        p = parallel_apply(self.top_l_replicas, z, None, device_ids)
-
-        ### gather the distributed results ###
-        p0 = gather(p, self.output_d, dim=0)
-
-        # clamp output if needed
-        if 0.0 < self.loss_threshold and self.loss_threshold < 1.0:
-            z0 = torch.clamp(
-                p0, min=self.loss_threshold, max=(1.0 - self.loss_threshold)
-            )
-        else:
-            z0 = p0
-
-        return z0
-
 
 def dash_separated_ints(value):
     vals = value.split("-")
@@ -800,6 +542,7 @@ def dash_separated_floats(value):
             )
 
     return value
+
 
 def calculateCompressionRate(args, dlrm, log_iter=-1):
     #1. Get the selector network from DLRM
@@ -831,6 +574,7 @@ def calculateCompressionRate(args, dlrm, log_iter=-1):
     )
     return dim_compression_rate, bit_compression_rate
 
+
 def inference(
     args,
     dlrm,
@@ -843,10 +587,6 @@ def inference(
 ):
     test_accu = 0
     test_samp = 0
-
-    if args.mlperf_logging:
-        scores = []
-        targets = []
 
     for i, testBatch in enumerate(test_ld):
         # early exit if nbatches was set by the user and was exceeded
@@ -880,57 +620,19 @@ def inference(
         if ext_dist.my_size > 1:
             Z_test = ext_dist.all_gather(Z_test, batch_split_lengths)
 
-        if args.mlperf_logging:
+        with record_function("DLRM accuracy compute"):
+            # compute loss and accuracy
             S_test = Z_test.detach().cpu().numpy()  # numpy array
             T_test = T_test.detach().cpu().numpy()  # numpy array
-            scores.append(S_test)
-            targets.append(T_test)
-        else:
-            with record_function("DLRM accuracy compute"):
-                # compute loss and accuracy
-                S_test = Z_test.detach().cpu().numpy()  # numpy array
-                T_test = T_test.detach().cpu().numpy()  # numpy array
 
-                mbs_test = T_test.shape[0]  # = mini_batch_size except last
-                A_test = np.sum((np.round(S_test, 0) == T_test).astype(np.uint8))
+            mbs_test = T_test.shape[0]  # = mini_batch_size except last
+            A_test = np.sum((np.round(S_test, 0) == T_test).astype(np.uint8))
 
-                test_accu += A_test
-                test_samp += mbs_test
+            test_accu += A_test
+            test_samp += mbs_test
 
-    if args.mlperf_logging:
-        with record_function("DLRM mlperf sklearn metrics compute"):
-            scores = np.concatenate(scores, axis=0)
-            targets = np.concatenate(targets, axis=0)
-
-            metrics = {
-                "recall": lambda y_true, y_score: sklearn.metrics.recall_score(
-                    y_true=y_true, y_pred=np.round(y_score)
-                ),
-                "precision": lambda y_true, y_score: sklearn.metrics.precision_score(
-                    y_true=y_true, y_pred=np.round(y_score)
-                ),
-                "f1": lambda y_true, y_score: sklearn.metrics.f1_score(
-                    y_true=y_true, y_pred=np.round(y_score)
-                ),
-                "ap": sklearn.metrics.average_precision_score,
-                "roc_auc": sklearn.metrics.roc_auc_score,
-                "accuracy": lambda y_true, y_score: sklearn.metrics.accuracy_score(
-                    y_true=y_true, y_pred=np.round(y_score)
-                ),
-            }
-
-        validation_results = {}
-        for metric_name, metric_function in metrics.items():
-            validation_results[metric_name] = metric_function(targets, scores)
-            writer.add_scalar(
-                "mlperf-metrics-test/" + metric_name,
-                validation_results[metric_name],
-                log_iter,
-            )
-        acc_test = validation_results["accuracy"]
-    else:
-        acc_test = test_accu / test_samp
-        writer.add_scalar("Test/Acc", acc_test, log_iter)
+    acc_test = test_accu / test_samp
+    writer.add_scalar("Test/Acc", acc_test, log_iter)
 
     model_metrics_dict = {
         "nepochs": args.nepochs,
@@ -940,37 +642,15 @@ def inference(
         "test_acc": acc_test,
     }
 
-    if args.mlperf_logging:
-        is_best = validation_results["roc_auc"] > best_auc_test
-        if is_best:
-            best_auc_test = validation_results["roc_auc"]
-            model_metrics_dict["test_auc"] = best_auc_test
-        print(
-            "recall {:.4f}, precision {:.4f},".format(
-                validation_results["recall"],
-                validation_results["precision"],
-            )
-            + " f1 {:.4f}, ap {:.4f},".format(
-                validation_results["f1"], validation_results["ap"]
-            )
-            + " auc {:.4f}, best auc {:.4f},".format(
-                validation_results["roc_auc"], best_auc_test
-            )
-            + " accuracy {:3.3f} %, best accuracy {:3.3f} %".format(
-                validation_results["accuracy"] * 100, best_acc_test * 100
-            ),
-            flush=True,
-        )
-    else:
-        is_best = acc_test > best_acc_test
-        if is_best:
-            best_acc_test = acc_test
-        print(
-            " accuracy {:3.3f} %, best {:3.3f} %".format(
-                acc_test * 100, best_acc_test * 100
-            ),
-            flush=True,
-        )
+    is_best = acc_test > best_acc_test
+    if is_best:
+        best_acc_test = acc_test
+    print(
+        " accuracy {:3.3f} %, best {:3.3f} %".format(
+            acc_test * 100, best_acc_test * 100
+        ),
+        flush=True,
+    )
     return model_metrics_dict, is_best
 
 
@@ -1124,12 +804,6 @@ def run():
             + "https://github.com/facebookresearch/dlrm/issues/172"
         )
 
-    if args.mlperf_logging:
-        mlperf_logger.log_event(key=mlperf_logger.constants.CACHE_CLEAR, value=True)
-        mlperf_logger.log_start(
-            key=mlperf_logger.constants.INIT_START, log_all_ranks=True
-        )
-
     if args.weighted_pooling is not None:
         if args.qr_flag:
             sys.exit("ERROR: quotient remainder with weighted pooling is not supported")
@@ -1162,11 +836,6 @@ def run():
 
     use_gpu = args.use_gpu and torch.cuda.is_available()
 
-    if not args.debug_mode:
-        ext_dist.init_distributed(
-            local_rank=args.local_rank, use_gpu=use_gpu, backend=args.dist_backend
-        )
-
     if use_gpu:
         torch.cuda.manual_seed_all(args.numpy_rand_seed)
         torch.backends.cudnn.deterministic = True
@@ -1184,13 +853,6 @@ def run():
     ### prepare training data ###
     ln_bot = np.fromstring(args.arch_mlp_bot, dtype=int, sep="-")
     # input data
-
-    if args.mlperf_logging:
-        mlperf_logger.barrier()
-        mlperf_logger.log_end(key=mlperf_logger.constants.INIT_STOP)
-        mlperf_logger.barrier()
-        mlperf_logger.log_start(key=mlperf_logger.constants.RUN_START)
-        mlperf_logger.barrier()
 
     if args.data_generation == "dataset":
         train_data, train_ld, test_data, test_ld = dp.make_criteo_data_and_loaders(args)
@@ -1232,8 +894,6 @@ def run():
         nbatches_test = len(test_ld)
 
     args.ln_emb = ln_emb.tolist()
-    if args.mlperf_logging:
-        print("command line args: ", json.dumps(vars(args)))
 
     ### parse command line arguments ###
     m_spa = args.arch_sparse_feature_size
@@ -1309,62 +969,6 @@ def run():
             round_dim=args.md_round_dims,
         ).tolist()
 
-    # test prints (model arch)
-    if args.debug_mode:
-        print("model arch:")
-        print(
-            "mlp top arch "
-            + str(ln_top.size - 1)
-            + " layers, with input to output dimensions:"
-        )
-        print(ln_top)
-        print("# of interactions")
-        print(num_int)
-        print(
-            "mlp bot arch "
-            + str(ln_bot.size - 1)
-            + " layers, with input to output dimensions:"
-        )
-        print(ln_bot)
-        print("# of features (sparse and dense)")
-        print(num_fea)
-        print("dense feature size")
-        print(m_den)
-        print("sparse feature size")
-        print(m_spa)
-        print(
-            "# of embeddings (= # of sparse features) "
-            + str(ln_emb.size)
-            + ", with dimensions "
-            + str(m_spa)
-            + "x:"
-        )
-        print(ln_emb)
-
-        print("data (inputs and targets):")
-        for j, inputBatch in enumerate(train_ld):
-            X, lS_o, lS_i, T, W, CBPP = unpack_batch(inputBatch)
-
-            torch.set_printoptions(precision=4)
-            # early exit if nbatches was set by the user and has been exceeded
-            if nbatches > 0 and j >= nbatches:
-                break
-            print("mini-batch: %d" % j)
-            print(X.detach().cpu())
-            # transform offsets to lengths when printing
-            print(
-                torch.IntTensor(
-                    [
-                        np.diff(
-                            S_o.detach().cpu().tolist() + list(lS_i[i].shape)
-                        ).tolist()
-                        for i, S_o in enumerate(lS_o)
-                    ]
-                )
-            )
-            print([S_i.detach().cpu() for S_i in lS_i])
-            print(T.detach().cpu())
-
     global ndevices
     ndevices = min(ngpus, args.mini_batch_size, num_fea - 1) if use_gpu else -1
 
@@ -1398,13 +1002,6 @@ def run():
         dyqbits_flag=args.dyqbits_flag,
         dyqbits_options=args.dyqbits_options,
     )
-
-    # test prints
-    if args.debug_mode:
-        print("initial parameters (weights and bias):")
-        for param in dlrm.parameters():
-            print(param.detach().cpu().numpy())
-        # print(dlrm)
 
     if use_gpu:
         # Custom Model-Data Parallel
@@ -1483,15 +1080,6 @@ def run():
     total_iter = 0
     total_samp = 0
 
-    if args.mlperf_logging:
-        mlperf_logger.mlperf_submission_log("dlrm")
-        mlperf_logger.log_event(
-            key=mlperf_logger.constants.SEED, value=args.numpy_rand_seed
-        )
-        mlperf_logger.log_event(
-            key=mlperf_logger.constants.GLOBAL_BATCH_SIZE, value=args.mini_batch_size
-        )
-
     # Load model is specified
     if not (args.load_model == ""):
         print("Loading saved model {}".format(args.load_model))
@@ -1520,8 +1108,6 @@ def run():
         ld_nbatches_test = ld_model["nbatches_test"]
         ld_train_loss = ld_model["train_loss"]
         ld_total_loss = ld_model["total_loss"]
-        if args.mlperf_logging:
-            ld_gAUC_test = ld_model["test_auc"]
         ld_acc_test = ld_model["test_acc"]
         if not args.inference_only:
             optimizer.load_state_dict(ld_model["opt_state_dict"])
@@ -1543,14 +1129,7 @@ def run():
                 ld_train_loss,
             )
         )
-        if args.mlperf_logging:
-            print(
-                "Testing state: accuracy = {:3.3f} %, auc = {:.3f}".format(
-                    ld_acc_test * 100, ld_gAUC_test
-                )
-            )
-        else:
-            print("Testing state: accuracy = {:3.3f} %".format(ld_acc_test * 100))
+        print("Testing state: accuracy = {:3.3f} %".format(ld_acc_test * 100))
 
     # Load model v2 is specified
     if not (args.load_model_v2 == ""):
@@ -1607,28 +1186,6 @@ def run():
 
     print("time/loss/accuracy (if enabled):")
 
-    if args.mlperf_logging:
-        # LR is logged twice for now because of a compliance checker bug
-        mlperf_logger.log_event(
-            key=mlperf_logger.constants.OPT_BASE_LR, value=args.learning_rate
-        )
-        mlperf_logger.log_event(
-            key=mlperf_logger.constants.OPT_LR_WARMUP_STEPS,
-            value=args.lr_num_warmup_steps,
-        )
-
-        # use logging keys from the official HP table and not from the logging library
-        mlperf_logger.log_event(
-            key="sgd_opt_base_learning_rate", value=args.learning_rate
-        )
-        mlperf_logger.log_event(
-            key="lr_decay_start_steps", value=args.lr_decay_start_step
-        )
-        mlperf_logger.log_event(
-            key="sgd_opt_learning_rate_decay_steps", value=args.lr_num_decay_steps
-        )
-        mlperf_logger.log_event(key="sgd_opt_learning_rate_decay_poly_power", value=2)
-
     tb_file = "./" + args.tensor_board_filename
     writer = SummaryWriter(tb_file)
 
@@ -1640,26 +1197,9 @@ def run():
             k = 0
             total_time_begin = 0
             while k < args.nepochs:
-                if args.mlperf_logging:
-                    mlperf_logger.barrier()
-                    mlperf_logger.log_start(
-                        key=mlperf_logger.constants.BLOCK_START,
-                        metadata={
-                            mlperf_logger.constants.FIRST_EPOCH_NUM: (k + 1),
-                            mlperf_logger.constants.EPOCH_COUNT: 1,
-                        },
-                    )
-                    mlperf_logger.barrier()
-                    mlperf_logger.log_start(
-                        key=mlperf_logger.constants.EPOCH_START,
-                        metadata={mlperf_logger.constants.EPOCH_NUM: (k + 1)},
-                    )
 
                 if k < skip_upto_epoch:
                     continue
-
-                if args.mlperf_logging:
-                    previous_iteration_time = None
 
                 for j, inputBatch in enumerate(train_ld):
                     if j == 0 and args.save_onnx:
@@ -1670,15 +1210,7 @@ def run():
 
                     X, lS_o, lS_i, T, W, CBPP = unpack_batch(inputBatch)
 
-                    if args.mlperf_logging:
-                        current_time = time_wrap(use_gpu)
-                        if previous_iteration_time:
-                            iteration_time = current_time - previous_iteration_time
-                        else:
-                            iteration_time = 0
-                        previous_iteration_time = current_time
-                    else:
-                        t1 = time_wrap(use_gpu)
+                    t1 = time_wrap(use_gpu)
 
                     # early exit if nbatches was set by the user and has been exceeded
                     if nbatches > 0 and j >= nbatches:
@@ -1735,27 +1267,16 @@ def run():
                     with record_function("DLRM backward"):
                         # scaled error gradient propagation
                         # (where we do not accumulate gradients across mini-batches)
-                        if (
-                            args.mlperf_logging
-                            and (j + 1) % args.mlperf_grad_accum_iter == 0
-                        ) or not args.mlperf_logging:
-                            optimizer.zero_grad()
+                        optimizer.zero_grad()
                         # backward pass
                         E.backward()
 
                         # optimizer
-                        if (
-                            args.mlperf_logging
-                            and (j + 1) % args.mlperf_grad_accum_iter == 0
-                        ) or not args.mlperf_logging:
-                            optimizer.step()
-                            lr_scheduler.step()
+                        optimizer.step()
+                        lr_scheduler.step()
 
-                    if args.mlperf_logging:
-                        total_time += iteration_time
-                    else:
-                        t2 = time_wrap(use_gpu)
-                        total_time += t2 - t1
+                    t2 = time_wrap(use_gpu)
+                    total_time += t2 - t1
 
                     total_loss += L * mbs
                     if args.dyedims_flag:
@@ -1822,18 +1343,7 @@ def run():
                     # testing
                     if should_test:
                         epoch_num_float = (j + 1) / len(train_ld) + k + 1
-                        if args.mlperf_logging:
-                            mlperf_logger.barrier()
-                            mlperf_logger.log_start(
-                                key=mlperf_logger.constants.EVAL_START,
-                                metadata={
-                                    mlperf_logger.constants.EPOCH_NUM: epoch_num_float
-                                },
-                            )
 
-                        # don't measure training iter time in a test iteration
-                        if args.mlperf_logging:
-                            previous_iteration_time = None
                         print(
                             "Testing at - {}/{} of epoch {},".format(j + 1, nbatches, k)
                         )
@@ -1848,10 +1358,7 @@ def run():
                             log_iter,
                         )
                         if is_best:
-                            if args.mlperf_logging:
-                                best_auc_test = model_metrics_dict["test_auc"]
-                            else:
-                                best_acc_test = model_metrics_dict["test_acc"]
+                            best_acc_test = model_metrics_dict["test_acc"]
 
                         # Calculate the overall compression rate
                         if args.dyedims_flag or args.dyqbits_flag:
@@ -1872,71 +1379,12 @@ def run():
                             print("Saving model to {}".format(args.save_model+".epoch{}.iter{}".format(k, j+1)))
                             torch.save(model_metrics_dict, args.save_model+".epoch{}.iter{}".format(k, j+1))
 
-                        if args.mlperf_logging:
-                            mlperf_logger.barrier()
-                            mlperf_logger.log_end(
-                                key=mlperf_logger.constants.EVAL_STOP,
-                                metadata={
-                                    mlperf_logger.constants.EPOCH_NUM: epoch_num_float
-                                },
-                            )
 
                         # Uncomment the line below to print out the total time with overhead
                         # print("Total test time for this group: {}" \
                         # .format(time_wrap(use_gpu) - accum_test_time_begin))
 
-                        if (
-                            args.mlperf_logging
-                            and (args.mlperf_acc_threshold > 0)
-                            and (best_acc_test > args.mlperf_acc_threshold)
-                        ):
-                            print(
-                                "MLPerf testing accuracy threshold "
-                                + str(args.mlperf_acc_threshold)
-                                + " reached, stop training"
-                            )
-                            break
-
-                        if (
-                            args.mlperf_logging
-                            and (args.mlperf_auc_threshold > 0)
-                            and (best_auc_test > args.mlperf_auc_threshold)
-                        ):
-                            print(
-                                "MLPerf testing auc threshold "
-                                + str(args.mlperf_auc_threshold)
-                                + " reached, stop training"
-                            )
-                            if args.mlperf_logging:
-                                mlperf_logger.barrier()
-                                mlperf_logger.log_end(
-                                    key=mlperf_logger.constants.RUN_STOP,
-                                    metadata={
-                                        mlperf_logger.constants.STATUS: mlperf_logger.constants.SUCCESS
-                                    },
-                                )
-                            break
-
-                if args.mlperf_logging:
-                    mlperf_logger.barrier()
-                    mlperf_logger.log_end(
-                        key=mlperf_logger.constants.EPOCH_STOP,
-                        metadata={mlperf_logger.constants.EPOCH_NUM: (k + 1)},
-                    )
-                    mlperf_logger.barrier()
-                    mlperf_logger.log_end(
-                        key=mlperf_logger.constants.BLOCK_STOP,
-                        metadata={mlperf_logger.constants.FIRST_EPOCH_NUM: (k + 1)},
-                    )
                 k += 1  # nepochs
-            if args.mlperf_logging and best_auc_test <= args.mlperf_auc_threshold:
-                mlperf_logger.barrier()
-                mlperf_logger.log_end(
-                    key=mlperf_logger.constants.RUN_STOP,
-                    metadata={
-                        mlperf_logger.constants.STATUS: mlperf_logger.constants.ABORTED
-                    },
-                )
         else:
             print("Testing for inference only")
             inference(
@@ -1949,115 +1397,6 @@ def run():
                 use_gpu,
             )
 
-    # profiling
-    if args.enable_profiling:
-        time_stamp = str(datetime.datetime.now()).replace(" ", "_")
-        with open("dlrm_s_pytorch" + time_stamp + "_shape.prof", "w") as prof_f:
-            prof_f.write(
-                prof.key_averages(group_by_input_shape=True).table(
-                    sort_by="self_cpu_time_total"
-                )
-            )
-        with open("dlrm_s_pytorch" + time_stamp + "_total.prof", "w") as prof_f:
-            prof_f.write(prof.key_averages().table(sort_by="self_cpu_time_total"))
-        prof.export_chrome_trace("dlrm_s_pytorch" + time_stamp + ".json")
-        # print(prof.key_averages().table(sort_by="cpu_time_total"))
-
-    # plot compute graph
-    if args.plot_compute_graph:
-        sys.exit(
-            "ERROR: Please install pytorchviz package in order to use the"
-            + " visualization. Then, uncomment its import above as well as"
-            + " three lines below and run the code again."
-        )
-        # V = Z.mean() if args.inference_only else E
-        # dot = make_dot(V, params=dict(dlrm.named_parameters()))
-        # dot.render('dlrm_s_pytorch_graph') # write .pdf file
-
-    # test prints
-    if not args.inference_only and args.debug_mode:
-        print("updated parameters (weights and bias):")
-        for param in dlrm.parameters():
-            print(param.detach().cpu().numpy())
-
-    # export the model in onnx
-    if args.save_onnx:
-        """
-        # workaround 1: tensor -> list
-        if torch.is_tensor(lS_i_onnx):
-            lS_i_onnx = [lS_i_onnx[j] for j in range(len(lS_i_onnx))]
-        # workaound 2: list -> tensor
-        lS_i_onnx = torch.stack(lS_i_onnx)
-        """
-        # debug prints
-        # print("inputs", X_onnx, lS_o_onnx, lS_i_onnx)
-        # print("output", dlrm_wrap(X_onnx, lS_o_onnx, lS_i_onnx, use_gpu, device))
-        dlrm_pytorch_onnx_file = "dlrm_s_pytorch.onnx"
-        batch_size = X_onnx.shape[0]
-        print("X_onnx.shape", X_onnx.shape)
-        if torch.is_tensor(lS_o_onnx):
-            print("lS_o_onnx.shape", lS_o_onnx.shape)
-        else:
-            for oo in lS_o_onnx:
-                print("oo.shape", oo.shape)
-        if torch.is_tensor(lS_i_onnx):
-            print("lS_i_onnx.shape", lS_i_onnx.shape)
-        else:
-            for ii in lS_i_onnx:
-                print("ii.shape", ii.shape)
-
-        # name inputs and outputs
-        o_inputs = (
-            ["offsets"]
-            if torch.is_tensor(lS_o_onnx)
-            else ["offsets_" + str(i) for i in range(len(lS_o_onnx))]
-        )
-        i_inputs = (
-            ["indices"]
-            if torch.is_tensor(lS_i_onnx)
-            else ["indices_" + str(i) for i in range(len(lS_i_onnx))]
-        )
-        all_inputs = ["dense_x"] + o_inputs + i_inputs
-        # debug prints
-        print("inputs", all_inputs)
-
-        # create dynamic_axis dictionaries
-        do_inputs = (
-            [{"offsets": {1: "batch_size"}}]
-            if torch.is_tensor(lS_o_onnx)
-            else [
-                {"offsets_" + str(i): {0: "batch_size"}} for i in range(len(lS_o_onnx))
-            ]
-        )
-        di_inputs = (
-            [{"indices": {1: "batch_size"}}]
-            if torch.is_tensor(lS_i_onnx)
-            else [
-                {"indices_" + str(i): {0: "batch_size"}} for i in range(len(lS_i_onnx))
-            ]
-        )
-        dynamic_axes = {"dense_x": {0: "batch_size"}, "pred": {0: "batch_size"}}
-        for do in do_inputs:
-            dynamic_axes.update(do)
-        for di in di_inputs:
-            dynamic_axes.update(di)
-        # debug prints
-        print(dynamic_axes)
-        # export model
-        torch.onnx.export(
-            dlrm,
-            (X_onnx, lS_o_onnx, lS_i_onnx),
-            dlrm_pytorch_onnx_file,
-            verbose=True,
-            opset_version=11,
-            input_names=all_inputs,
-            output_names=["pred"],
-            dynamic_axes=dynamic_axes,
-        )
-        # recover the model back
-        dlrm_pytorch_onnx = onnx.load("dlrm_s_pytorch.onnx")
-        # check the onnx model
-        onnx.checker.check_model(dlrm_pytorch_onnx)
     total_time_end = time_wrap(use_gpu)
 
 
