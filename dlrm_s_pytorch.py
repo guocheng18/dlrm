@@ -52,11 +52,6 @@ def loss_fn_wrap(Z, T, use_gpu, device):
     with record_function("DLRM loss compute"):
         if args.loss_function == "mse" or args.loss_function == "bce":
             return dlrm.loss_fn(Z, T.to(device))
-        elif args.loss_function == "wbce":
-            loss_ws_ = dlrm.loss_ws[T.data.view(-1).long()].view_as(T).to(device)
-            loss_fn_ = dlrm.loss_fn(Z, T.to(device))
-            loss_sc_ = loss_ws_ * loss_fn_
-            return loss_sc_.mean()
 
 
 def unpack_batch(b):
@@ -334,7 +329,6 @@ def dash_separated_ints(value):
             raise argparse.ArgumentTypeError(
                 "%s is not a valid dash separated list of ints" % value
             )
-
     return value
 
 
@@ -347,7 +341,6 @@ def dash_separated_floats(value):
             raise argparse.ArgumentTypeError(
                 "%s is not a valid dash separated list of floats" % value
             )
-
     return value
 
 
@@ -404,11 +397,6 @@ def inference(
             testBatch
         )
 
-        # Skip the batch if batch size not multiple of total ranks
-        if ext_dist.my_size > 1 and X_test.size(0) % ext_dist.my_size != 0:
-            print("Warning: Skiping the batch %d with size %d" % (i, X_test.size(0)))
-            continue
-
         # forward pass
         Z_test, _, _ = dlrm_wrap(
             X_test,
@@ -423,9 +411,6 @@ def inference(
         # tensor is on GPU memory
         if Z_test.is_cuda:
             torch.cuda.synchronize()
-        (_, batch_split_lengths) = ext_dist.get_split_lengths(X_test.size(0))
-        if ext_dist.my_size > 1:
-            Z_test = ext_dist.all_gather(Z_test, batch_split_lengths)
 
         with record_function("DLRM accuracy compute"):
             # compute loss and accuracy
@@ -533,13 +518,8 @@ def run():
     )
     # inference
     parser.add_argument("--inference-only", action="store_true", default=False)
-    # onnx
-    parser.add_argument("--save-onnx", action="store_true", default=False)
     # gpu
     parser.add_argument("--use-gpu", action="store_true", default=False)
-    # distributed
-    parser.add_argument("--local_rank", type=int, default=-1)
-    parser.add_argument("--dist-backend", type=str, default="")
     # debugging and profiling
     parser.add_argument("--print-freq", type=int, default=1)
     parser.add_argument("--test-freq", type=int, default=-1)
@@ -719,18 +699,7 @@ def run():
     )
 
     if use_gpu:
-        # Custom Model-Data Parallel
-        # the mlps are replicated and use data parallelism, while
-        # the embeddings are distributed and use model parallelism
         dlrm = dlrm.to(device)  # .cuda()
-        if dlrm.ndevices > 1:
-            dlrm.emb_l, dlrm.v_W_l = dlrm.create_emb(
-                m_spa, ln_emb, args.weighted_pooling
-            )
-        else:
-            if dlrm.weighted_pooling == "fixed":
-                for k, w in enumerate(dlrm.v_W_l):
-                    dlrm.v_W_l[k] = w.cuda()
 
     if not args.inference_only:
         if use_gpu and args.optimizer in ["rwsadagrad", "adagrad"]:
@@ -757,47 +726,6 @@ def run():
     total_dyqbits_loss = 0
     total_iter = 0
     total_samp = 0
-
-    if not (args.load_model == ""):
-        print("Loading saved model {}".format(args.load_model))
-        if use_gpu:
-            ld_model = torch.load(
-                args.load_model,
-                map_location=torch.device("cuda"),
-            )
-        else:
-            # when targeting inference on CPU
-            ld_model = torch.load(args.load_model, map_location=torch.device("cpu"))
-        dlrm.load_state_dict(ld_model["state_dict"])
-        ld_j = ld_model["iter"]
-        ld_k = ld_model["epoch"]
-        ld_nepochs = ld_model["nepochs"]
-        ld_nbatches = ld_model["nbatches"]
-        ld_nbatches_test = ld_model["nbatches_test"]
-        ld_train_loss = ld_model["train_loss"]
-        ld_total_loss = ld_model["total_loss"]
-        ld_acc_test = ld_model["test_acc"]
-        if not args.inference_only:
-            optimizer.load_state_dict(ld_model["opt_state_dict"])
-            best_acc_test = ld_acc_test
-            total_loss = ld_total_loss
-            skip_upto_epoch = ld_k  # epochs
-            skip_upto_batch = ld_j  # batches
-        else:
-            args.print_freq = ld_nbatches
-            args.test_freq = 0
-
-        print(
-            "Saved at: epoch = {:d}/{:d}, batch = {:d}/{:d}, ntbatch = {:d}".format(
-                ld_k, ld_nepochs, ld_j, ld_nbatches, ld_nbatches_test
-            )
-        )
-        print(
-            "Training state: loss = {:.6f}".format(
-                ld_train_loss,
-            )
-        )
-        print("Testing state: accuracy = {:3.3f} %".format(ld_acc_test * 100))
 
     # Load model v2 is specified
     if not (args.load_model_v2 == ""):
@@ -834,9 +762,6 @@ def run():
                     continue
 
                 for j, inputBatch in enumerate(train_ld):
-                    if j == 0 and args.save_onnx:
-                        X_onnx, lS_o_onnx, lS_i_onnx, _, _, _ = unpack_batch(inputBatch)
-
                     if j < skip_upto_batch:
                         continue
 
@@ -873,16 +798,6 @@ def run():
                         L1 = (args.dyedims_loss_temp * avg_dims).detach().cpu().numpy()
                     if args.dyqbits_flag:
                         L2 = (args.dyqbits_loss_temp * avg_bits).detach().cpu().numpy()
-                    # training accuracy is not disabled
-                    # S = Z.detach().cpu().numpy()  # numpy array
-                    # T = T.detach().cpu().numpy()  # numpy array
-
-                    # # print("res: ", S)
-
-                    # # print("j, train: BCE ", j, L)
-
-                    # mbs = T.shape[0]  # = args.mini_batch_size except maybe for last
-                    # A = np.sum((np.round(S, 0) == T).astype(np.uint8))
 
                     with record_function("DLRM backward"):
                         # scaled error gradient propagation
@@ -961,8 +876,6 @@ def run():
 
                     # testing
                     if should_test:
-                        epoch_num_float = (j + 1) / len(train_ld) + k + 1
-
                         print(
                             "Testing at - {}/{} of epoch {},".format(j + 1, nbatches, k)
                         )
@@ -998,12 +911,7 @@ def run():
                             print("Saving model to {}".format(args.save_model+".epoch{}.iter{}".format(k, j+1)))
                             torch.save(model_metrics_dict, args.save_model+".epoch{}.iter{}".format(k, j+1))
 
-
-                        # Uncomment the line below to print out the total time with overhead
-                        # print("Total test time for this group: {}" \
-                        # .format(time_wrap(use_gpu) - accum_test_time_begin))
-
-                k += 1  # nepochs
+                k += 1
         else:
             print("Testing for inference only")
             inference(
@@ -1015,9 +923,6 @@ def run():
                 device,
                 use_gpu,
             )
-
-    total_time_end = time_wrap(use_gpu)
-
 
 if __name__ == "__main__":
     run()
