@@ -2,48 +2,20 @@ from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
 import argparse
-# miscellaneous
 import builtins
 import sys
 import time
-# onnx
-# The onnx import causes deprecation warnings every time workers
-# are spawned during testing. So, we filter out those warnings.
 
-# numpy
 import numpy as np
-# pytorch
 import torch
 import torch.nn as nn
 
-# data generation
 import dlrm_data_pytorch as dp
-# For distributed run
-import extend_distributed as ext_dist
 import optim.rwsadagrad as RowWiseSparseAdagrad
-
-# dataloader
-try:
-    from internals import fbDataLoader, fbInputBatchFormatter
-
-    has_internal_libs = True
-except ImportError:
-    has_internal_libs = False
 
 from torch._ops import ops
 from torch.autograd.profiler import record_function
-from torch.nn.parameter import Parameter
-from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.tensorboard import SummaryWriter
-
-# mixed-dimension trick
-from tricks.md_embedding_bag import PrEmbeddingBag, md_solver
-# quotient-remainder trick
-from tricks.qr_embedding_bag import QREmbeddingBag
-
-# from torchviz import make_dot
-# import torch.nn.functional as Functional
-# from torch.nn.parameter import Parameter
 
 from quantizations import FP8QuantDequantSTE, FP16QuantDequantSTE
 from selection_networks import EdimQbitSelectionNetwork
@@ -87,82 +59,27 @@ def loss_fn_wrap(Z, T, use_gpu, device):
             return loss_sc_.mean()
 
 
-# The following function is a wrapper to avoid checking this multiple times in th
-# loop below.
 def unpack_batch(b):
-    if args.data_generation == "internal":
-        return fbInputBatchFormatter(b, args.data_size)
-    else:
-        # Experiment with unweighted samples
-        return b[0], b[1], b[2], b[3], torch.ones(b[3].size()), None
+    return b[0], b[1], b[2], b[3], torch.ones(b[3].size()), None
 
 
-class LRPolicyScheduler(_LRScheduler):
-    def __init__(self, optimizer, num_warmup_steps, decay_start_step, num_decay_steps):
-        self.num_warmup_steps = num_warmup_steps
-        self.decay_start_step = decay_start_step
-        self.decay_end_step = decay_start_step + num_decay_steps
-        self.num_decay_steps = num_decay_steps
-
-        if self.decay_start_step < self.num_warmup_steps:
-            sys.exit("Learning rate warmup must finish before the decay starts")
-
-        super(LRPolicyScheduler, self).__init__(optimizer)
-
-    def get_lr(self):
-        step_count = self._step_count
-        if step_count < self.num_warmup_steps:
-            # warmup
-            scale = 1.0 - (self.num_warmup_steps - step_count) / self.num_warmup_steps
-            lr = [base_lr * scale for base_lr in self.base_lrs]
-            self.last_lr = lr
-        elif self.decay_start_step <= step_count and step_count < self.decay_end_step:
-            # decay
-            decayed_steps = step_count - self.decay_start_step
-            scale = ((self.num_decay_steps - decayed_steps) / self.num_decay_steps) ** 2
-            min_lr = 0.0000001
-            lr = [max(min_lr, base_lr * scale) for base_lr in self.base_lrs]
-            self.last_lr = lr
-        else:
-            if self.num_decay_steps > 0:
-                # freeze at last, either because we're after decay
-                # or because we're between warmup and decay
-                lr = self.last_lr
-            else:
-                # do not adjust
-                lr = self.base_lrs
-        return lr
-
-
-### define dlrm in PyTorch ###
 class DLRM_Net(nn.Module):
     def create_mlp(self, ln, sigmoid_layer):
-        # build MLP layer by layer
         layers = nn.ModuleList()
         for i in range(0, ln.size - 1):
             n = ln[i]
             m = ln[i + 1]
 
-            # construct fully connected operator
             LL = nn.Linear(int(n), int(m), bias=True)
 
-            # initialize the weights
-            # with torch.no_grad():
-            # custom Xavier input, output or two-sided fill
             mean = 0.0  # std_dev = np.sqrt(variance)
             std_dev = np.sqrt(2 / (m + n))  # np.sqrt(1 / m) # np.sqrt(1 / n)
             W = np.random.normal(mean, std_dev, size=(m, n)).astype(np.float32)
             std_dev = np.sqrt(1 / m)  # np.sqrt(2 / (m + 1))
             bt = np.random.normal(mean, std_dev, size=m).astype(np.float32)
-            # approach 1
             LL.weight.data = torch.tensor(W, requires_grad=True)
             LL.bias.data = torch.tensor(bt, requires_grad=True)
-            # approach 2
-            # LL.weight.data.copy_(torch.tensor(W))
-            # LL.bias.data.copy_(torch.tensor(bt))
-            # approach 3
-            # LL.weight = Parameter(torch.tensor(W),requires_grad=True)
-            # LL.bias = Parameter(torch.tensor(bt),requires_grad=True)
+
             layers.append(LL)
 
             # construct sigmoid or relu operator
@@ -171,9 +88,6 @@ class DLRM_Net(nn.Module):
             else:
                 layers.append(nn.ReLU())
 
-        # approach 1: use ModuleList
-        # return layers
-        # approach 2: use Sequential container to wrap all layers
         return torch.nn.Sequential(*layers)
 
     def create_emb(self, m, ln, weighted_pooling=None):
@@ -182,17 +96,12 @@ class DLRM_Net(nn.Module):
         for i in range(0, ln.size):
             n = ln[i]
             EE = nn.EmbeddingBag(n, m, mode="sum", sparse=True)
-            # initialize embeddings
-            # nn.init.uniform_(EE.weight, a=-np.sqrt(1 / n), b=np.sqrt(1 / n))
+
             W = np.random.uniform(
                 low=-np.sqrt(1 / n), high=np.sqrt(1 / n), size=(n, m)
             ).astype(np.float32)
-            # approach 1
             EE.weight.data = torch.tensor(W, requires_grad=True)
-            # approach 2
-            # EE.weight.data.copy_(torch.tensor(W))
-            # approach 3
-            # EE.weight = Parameter(torch.tensor(W),requires_grad=True)
+            
             if weighted_pooling is None:
                 v_W_l.append(None)
             else:
@@ -224,13 +133,6 @@ class DLRM_Net(nn.Module):
         sync_dense_params=True,
         loss_threshold=0.0,
         ndevices=-1,
-        qr_flag=False,
-        qr_operation="mult",
-        qr_collisions=0,
-        qr_threshold=200,
-        md_flag=False,
-        md_threshold=200,
-        weighted_pooling=None,
         loss_function="bce",
         dyedims_flag=False,
         dyedims_options=None,
@@ -261,54 +163,15 @@ class DLRM_Net(nn.Module):
             self.dyedims_options = dyedims_options
             self.dyqbits_flag = dyqbits_flag
             self.dyqbits_options = dyqbits_options
-            if weighted_pooling is not None and weighted_pooling != "fixed":
-                self.weighted_pooling = "learned"
-            else:
-                self.weighted_pooling = weighted_pooling
-            # create variables for QR embedding if applicable
-            self.qr_flag = qr_flag
-            if self.qr_flag:
-                self.qr_collisions = qr_collisions
-                self.qr_operation = qr_operation
-                self.qr_threshold = qr_threshold
-            # create variables for MD embedding if applicable
-            self.md_flag = md_flag
-            if self.md_flag:
-                self.md_threshold = md_threshold
-
-            # If running distributed, get local slice of embedding tables
-            if ext_dist.my_size > 1:
-                n_emb = len(ln_emb)
-                if n_emb < ext_dist.my_size:
-                    sys.exit(
-                        "only (%d) sparse features for (%d) devices, table partitions will fail"
-                        % (n_emb, ext_dist.my_size)
-                    )
-                self.n_global_emb = n_emb
-                self.n_local_emb, self.n_emb_per_rank = ext_dist.get_split_lengths(
-                    n_emb
-                )
-                self.local_emb_slice = ext_dist.get_my_slice(n_emb)
-                self.local_emb_indices = list(range(n_emb))[self.local_emb_slice]
 
             # create operators
             if ndevices <= 1:
-                self.emb_l, w_list = self.create_emb(m_spa, ln_emb, weighted_pooling)
-                if self.weighted_pooling == "learned":
-                    self.v_W_l = nn.ParameterList()
-                    for w in w_list:
-                        self.v_W_l.append(Parameter(w))
-                else:
-                    self.v_W_l = w_list
+                self.emb_l, w_list = self.create_emb(m_spa, ln_emb)
+                self.v_W_l = w_list
                 if self.dyedims_flag or self.dyqbits_flag:
                     self.selector = EdimQbitSelectionNetwork(m_spa, 2*m_spa, len(self.dyedims_options), len(self.dyqbits_options))
             self.bot_l = self.create_mlp(ln_bot, sigmoid_bot)
             self.top_l = self.create_mlp(ln_top, sigmoid_top)
-
-            # quantization
-            self.quantize_emb = False
-            self.emb_l_q = []
-            self.quantize_bits = 32
 
             # specify the loss function
             if self.loss_function == "mse":
@@ -326,11 +189,6 @@ class DLRM_Net(nn.Module):
                 )
 
     def apply_mlp(self, x, layers):
-        # approach 1: use ModuleList
-        # for layer in layers:
-        #     x = layer(x)
-        # return x
-        # approach 2: use Sequential container to wrap all layers
         return layers(x)
 
     def apply_emb(self, lS_o, lS_i, emb_l, v_W_l):
@@ -356,59 +214,16 @@ class DLRM_Net(nn.Module):
             else:
                 per_sample_weights = None
 
-            if self.quantize_emb:
-                s1 = self.emb_l_q[k].element_size() * self.emb_l_q[k].nelement()
-                s2 = self.emb_l_q[k].element_size() * self.emb_l_q[k].nelement()
-                print("quantized emb sizes:", s1, s2)
+            E = emb_l[k]
+            V = E(
+                sparse_index_group_batch,
+                sparse_offset_group_batch,
+                per_sample_weights=per_sample_weights,
+            )
 
-                if self.quantize_bits == 4:
-                    QV = ops.quantized.embedding_bag_4bit_rowwise_offsets(
-                        self.emb_l_q[k],
-                        sparse_index_group_batch,
-                        sparse_offset_group_batch,
-                        per_sample_weights=per_sample_weights,
-                    )
-                elif self.quantize_bits == 8:
-                    QV = ops.quantized.embedding_bag_byte_rowwise_offsets(
-                        self.emb_l_q[k],
-                        sparse_index_group_batch,
-                        sparse_offset_group_batch,
-                        per_sample_weights=per_sample_weights,
-                    )
+            ly.append(V)
 
-                ly.append(QV)
-            else:
-                E = emb_l[k]
-                V = E(
-                    sparse_index_group_batch,
-                    sparse_offset_group_batch,
-                    per_sample_weights=per_sample_weights,
-                )
-
-                ly.append(V)
-
-        # print(ly)
         return ly
-
-    #  using quantizing functions from caffe2/aten/src/ATen/native/quantized/cpu
-    def quantize_embedding(self, bits):
-
-        n = len(self.emb_l)
-        self.emb_l_q = [None] * n
-        for k in range(n):
-            if bits == 4:
-                self.emb_l_q[k] = ops.quantized.embedding_bag_4bit_prepack(
-                    self.emb_l[k].weight
-                )
-            elif bits == 8:
-                self.emb_l_q[k] = ops.quantized.embedding_bag_byte_prepack(
-                    self.emb_l[k].weight
-                )
-            else:
-                return
-        self.emb_l = None
-        self.quantize_emb = True
-        self.quantize_bits = bits
 
     def interact_features(self, x, ly):
 
@@ -446,15 +261,7 @@ class DLRM_Net(nn.Module):
         return R
 
     def forward(self, dense_x, lS_o, lS_i):
-        if ext_dist.my_size > 1:
-            # multi-node multi-device run
-            return self.distributed_forward(dense_x, lS_o, lS_i)
-        elif self.ndevices <= 1:
-            # single device run
-            return self.sequential_forward(dense_x, lS_o, lS_i)
-        else:
-            # single-node multi-device run
-            return self.parallel_forward(dense_x, lS_o, lS_i)
+        return self.sequential_forward(dense_x, lS_o, lS_i)
 
     def sequential_forward(self, dense_x, lS_o, lS_i):
         # batch size
@@ -671,16 +478,6 @@ def run():
         "--arch-interaction-op", type=str, choices=["dot", "cat"], default="dot"
     )
     parser.add_argument("--arch-interaction-itself", action="store_true", default=False)
-    parser.add_argument("--weighted-pooling", type=str, default=None)
-    # embedding table options
-    parser.add_argument("--md-flag", action="store_true", default=False)
-    parser.add_argument("--md-threshold", type=int, default=200)
-    parser.add_argument("--md-temperature", type=float, default=0.3)
-    parser.add_argument("--md-round-dims", action="store_true", default=False)
-    parser.add_argument("--qr-flag", action="store_true", default=False)
-    parser.add_argument("--qr-threshold", type=int, default=200)
-    parser.add_argument("--qr-operation", type=str, default="mult")
-    parser.add_argument("--qr-collisions", type=int, default=4)
     # activations and loss
     parser.add_argument("--activation-function", type=str, default="relu")
     parser.add_argument("--loss-function", type=str, default="mse")  # or bce or wbce
@@ -736,9 +533,6 @@ def run():
     )
     # inference
     parser.add_argument("--inference-only", action="store_true", default=False)
-    # quantize
-    parser.add_argument("--quantize-mlp-with-bit", type=int, default=32)
-    parser.add_argument("--quantize-emb-with-bit", type=int, default=32)
     # onnx
     parser.add_argument("--save-onnx", action="store_true", default=False)
     # gpu
@@ -760,20 +554,6 @@ def run():
     # store/load model
     parser.add_argument("--save-model", type=str, default="")
     parser.add_argument("--load-model", type=str, default="")
-    # mlperf logging (disables other output and stops early)
-    parser.add_argument("--mlperf-logging", action="store_true", default=False)
-    # stop at target accuracy Kaggle 0.789, Terabyte (sub-sampled=0.875) 0.8107
-    parser.add_argument("--mlperf-acc-threshold", type=float, default=0.0)
-    # stop at target AUC Terabyte (no subsampling) 0.8025
-    parser.add_argument("--mlperf-auc-threshold", type=float, default=0.0)
-    parser.add_argument("--mlperf-bin-loader", action="store_true", default=False)
-    parser.add_argument("--mlperf-bin-shuffle", action="store_true", default=False)
-    # mlperf gradient accumulation iterations
-    parser.add_argument("--mlperf-grad-accum-iter", type=int, default=1)
-    # LR policy
-    parser.add_argument("--lr-num-warmup-steps", type=int, default=0)
-    parser.add_argument("--lr-decay-start-step", type=int, default=0)
-    parser.add_argument("--lr-num-decay-steps", type=int, default=0)
 
     # Dynamic embedding dimensions
     parser.add_argument("--dyedims-flag", action="store_true", default=False)
@@ -804,23 +584,6 @@ def run():
             + "https://github.com/facebookresearch/dlrm/issues/172"
         )
 
-    if args.weighted_pooling is not None:
-        if args.qr_flag:
-            sys.exit("ERROR: quotient remainder with weighted pooling is not supported")
-        if args.md_flag:
-            sys.exit("ERROR: mixed dimensions with weighted pooling is not supported")
-    if args.quantize_emb_with_bit in [4, 8]:
-        if args.qr_flag:
-            sys.exit(
-                "ERROR: 4 and 8-bit quantization with quotient remainder is not supported"
-            )
-        if args.md_flag:
-            sys.exit(
-                "ERROR: 4 and 8-bit quantization with mixed dimensions is not supported"
-            )
-        if args.use_gpu:
-            sys.exit("ERROR: 4 and 8-bit quantization on GPU is not supported")
-
     ### some basic setup ###
     np.random.seed(args.numpy_rand_seed)
     np.set_printoptions(precision=args.print_precision)
@@ -839,12 +602,8 @@ def run():
     if use_gpu:
         torch.cuda.manual_seed_all(args.numpy_rand_seed)
         torch.backends.cudnn.deterministic = True
-        if ext_dist.my_size > 1:
-            ngpus = 1
-            device = torch.device("cuda", ext_dist.my_local_rank)
-        else:
-            ngpus = torch.cuda.device_count()
-            device = torch.device("cuda", 0)
+        ngpus = torch.cuda.device_count()
+        device = torch.device("cuda", 0)
         print("Using {} GPU(s)...".format(ngpus))
     else:
         device = torch.device("cpu")
@@ -875,14 +634,6 @@ def run():
             ln_emb = np.array(ln_emb)
         m_den = train_data.m_den
         ln_bot[0] = m_den
-    elif args.data_generation == "internal":
-        if not has_internal_libs:
-            raise Exception("Internal libraries are not available.")
-        NUM_BATCHES = 5000
-        nbatches = args.num_batches if args.num_batches > 0 else NUM_BATCHES
-        train_ld, feature_to_num_embeddings = fbDataLoader(args.data_size, nbatches)
-        ln_emb = np.array(list(feature_to_num_embeddings.values()))
-        m_den = ln_bot[0]
     else:
         # input and target at random
         ln_emb = np.fromstring(args.arch_embedding_size, dtype=int, sep="-")
@@ -902,9 +653,6 @@ def run():
 
     m_den_out = ln_bot[ln_bot.size - 1]
     if args.arch_interaction_op == "dot":
-        # approach 1: all
-        # num_int = num_fea * num_fea + m_den_out
-        # approach 2: unique
         if args.arch_interaction_itself:
             num_int = (num_fea * (num_fea + 1)) // 2 + m_den_out
         else:
@@ -928,30 +676,13 @@ def run():
             + " does not match first dim of bottom mlp "
             + str(ln_bot[0])
         )
-    if args.qr_flag:
-        if args.qr_operation == "concat" and 2 * m_spa != m_den_out:
-            sys.exit(
-                "ERROR: 2 arch-sparse-feature-size "
-                + str(2 * m_spa)
-                + " does not match last dim of bottom mlp "
-                + str(m_den_out)
-                + " (note that the last dim of bottom mlp must be 2x the embedding dim)"
-            )
-        if args.qr_operation != "concat" and m_spa != m_den_out:
-            sys.exit(
-                "ERROR: arch-sparse-feature-size "
-                + str(m_spa)
-                + " does not match last dim of bottom mlp "
-                + str(m_den_out)
-            )
-    else:
-        if m_spa != m_den_out:
-            sys.exit(
-                "ERROR: arch-sparse-feature-size "
-                + str(m_spa)
-                + " does not match last dim of bottom mlp "
-                + str(m_den_out)
-            )
+    if m_spa != m_den_out:
+        sys.exit(
+            "ERROR: arch-sparse-feature-size "
+            + str(m_spa)
+            + " does not match last dim of bottom mlp "
+            + str(m_den_out)
+        )
     if num_int != ln_top[0]:
         sys.exit(
             "ERROR: # of feature interactions "
@@ -959,15 +690,6 @@ def run():
             + " does not match first dimension of top mlp "
             + str(ln_top[0])
         )
-
-    # assign mixed dimensions if applicable
-    if args.md_flag:
-        m_spa = md_solver(
-            torch.tensor(ln_emb),
-            args.md_temperature,  # alpha
-            d0=m_spa,
-            round_dim=args.md_round_dims,
-        ).tolist()
 
     global ndevices
     ndevices = min(ngpus, args.mini_batch_size, num_fea - 1) if use_gpu else -1
@@ -989,13 +711,6 @@ def run():
         sync_dense_params=args.sync_dense_params,
         loss_threshold=args.loss_threshold,
         ndevices=ndevices,
-        qr_flag=args.qr_flag,
-        qr_operation=args.qr_operation,
-        qr_collisions=args.qr_collisions,
-        qr_threshold=args.qr_threshold,
-        md_flag=args.md_flag,
-        md_threshold=args.md_threshold,
-        weighted_pooling=args.weighted_pooling,
         loss_function=args.loss_function,
         dyedims_flag=args.dyedims_flag,
         dyedims_options=args.dyedims_options,
@@ -1017,16 +732,6 @@ def run():
                 for k, w in enumerate(dlrm.v_W_l):
                     dlrm.v_W_l[k] = w.cuda()
 
-    # distribute data parallel mlps
-    if ext_dist.my_size > 1:
-        if use_gpu:
-            device_ids = [ext_dist.my_local_rank]
-            dlrm.bot_l = ext_dist.DDP(dlrm.bot_l, device_ids=device_ids)
-            dlrm.top_l = ext_dist.DDP(dlrm.top_l, device_ids=device_ids)
-        else:
-            dlrm.bot_l = ext_dist.DDP(dlrm.bot_l)
-            dlrm.top_l = ext_dist.DDP(dlrm.top_l)
-
     if not args.inference_only:
         if use_gpu and args.optimizer in ["rwsadagrad", "adagrad"]:
             sys.exit("GPU version of Adagrad is not supported by PyTorch.")
@@ -1037,34 +742,7 @@ def run():
             "adagrad": torch.optim.Adagrad,
         }
 
-        parameters = (
-            dlrm.parameters()
-            if ext_dist.my_size == 1
-            else [
-                {
-                    "params": [p for emb in dlrm.emb_l for p in emb.parameters()],
-                    "lr": args.learning_rate,
-                },
-                # TODO check this lr setup
-                # bottom mlp has no data parallelism
-                # need to check how do we deal with top mlp
-                {
-                    "params": dlrm.bot_l.parameters(),
-                    "lr": args.learning_rate,
-                },
-                {
-                    "params": dlrm.top_l.parameters(),
-                    "lr": args.learning_rate,
-                },
-            ]
-        )
-        optimizer = opts[args.optimizer](parameters, lr=args.learning_rate)
-        lr_scheduler = LRPolicyScheduler(
-            optimizer,
-            args.lr_num_warmup_steps,
-            args.lr_decay_start_step,
-            args.lr_num_decay_steps,
-        )
+        optimizer = opts[args.optimizer](dlrm.parameters(), lr=args.learning_rate)
 
     ### main loop ###
 
@@ -1080,23 +758,13 @@ def run():
     total_iter = 0
     total_samp = 0
 
-    # Load model is specified
     if not (args.load_model == ""):
         print("Loading saved model {}".format(args.load_model))
         if use_gpu:
-            if dlrm.ndevices > 1:
-                # NOTE: when targeting inference on multiple GPUs,
-                # load the model as is on CPU or GPU, with the move
-                # to multiple GPUs to be done in parallel_forward
-                ld_model = torch.load(args.load_model)
-            else:
-                # NOTE: when targeting inference on single GPU,
-                # note that the call to .to(device) has already happened
-                ld_model = torch.load(
-                    args.load_model,
-                    map_location=torch.device("cuda"),
-                    # map_location=lambda storage, loc: storage.cuda(0)
-                )
+            ld_model = torch.load(
+                args.load_model,
+                map_location=torch.device("cuda"),
+            )
         else:
             # when targeting inference on CPU
             ld_model = torch.load(args.load_model, map_location=torch.device("cpu"))
@@ -1135,19 +803,11 @@ def run():
     if not (args.load_model_v2 == ""):
         print("Loading saved model v2 {}".format(args.load_model_v2))
         if use_gpu:
-            if dlrm.ndevices > 1:
-                # NOTE: when targeting inference on multiple GPUs,
-                # load the model as is on CPU or GPU, with the move
-                # to multiple GPUs to be done in parallel_forward
-                ld_model = torch.load(args.load_model_v2)
-            else:
-                # NOTE: when targeting inference on single GPU,
-                # note that the call to .to(device) has already happened
-                ld_model = torch.load(
-                    args.load_model_v2,
-                    map_location=torch.device("cuda"),
-                    # map_location=lambda storage, loc: storage.cuda(0)
-                )
+            ld_model = torch.load(
+                args.load_model_v2,
+                map_location=torch.device("cuda"),
+                # map_location=lambda storage, loc: storage.cuda(0)
+            )
         else:
             # when targeting inference on CPU
             ld_model = torch.load(args.load_model_v2, map_location=torch.device("cpu"))
@@ -1157,39 +817,11 @@ def run():
             if name.startswith("emb"):
                 param.requires_grad = False
 
-    if args.inference_only:
-        # Currently only dynamic quantization with INT8 and FP16 weights are
-        # supported for MLPs and INT4 and INT8 weights for EmbeddingBag
-        # post-training quantization during the inference.
-        # By default we don't do the quantization: quantize_{mlp,emb}_with_bit == 32 (FP32)
-        assert args.quantize_mlp_with_bit in [
-            8,
-            16,
-            32,
-        ], "only support 8/16/32-bit but got {}".format(args.quantize_mlp_with_bit)
-        assert args.quantize_emb_with_bit in [
-            4,
-            8,
-            32,
-        ], "only support 4/8/32-bit but got {}".format(args.quantize_emb_with_bit)
-        if args.quantize_mlp_with_bit != 32:
-            if args.quantize_mlp_with_bit in [8]:
-                quantize_dtype = torch.qint8
-            else:
-                quantize_dtype = torch.float16
-            dlrm = torch.quantization.quantize_dynamic(
-                dlrm, {torch.nn.Linear}, quantize_dtype
-            )
-        if args.quantize_emb_with_bit != 32:
-            dlrm.quantize_embedding(args.quantize_emb_with_bit)
-            # print(dlrm)
-
     print("time/loss/accuracy (if enabled):")
 
     tb_file = "./" + args.tensor_board_filename
     writer = SummaryWriter(tb_file)
 
-    ext_dist.barrier()
     with torch.autograd.profiler.profile(
         args.enable_profiling, use_cuda=use_gpu, record_shapes=True
     ) as prof:
@@ -1216,14 +848,6 @@ def run():
                     if nbatches > 0 and j >= nbatches:
                         break
 
-                    # Skip the batch if batch size not multiple of total ranks
-                    if ext_dist.my_size > 1 and X.size(0) % ext_dist.my_size != 0:
-                        print(
-                            "Warning: Skiping the batch %d with size %d"
-                            % (j, X.size(0))
-                        )
-                        continue
-
                     mbs = T.shape[0]  # = args.mini_batch_size except maybe for last
 
                     # forward pass
@@ -1235,10 +859,6 @@ def run():
                         device,
                         ndevices=ndevices,
                     )
-
-                    if ext_dist.my_size > 1:
-                        T = T[ext_dist.get_my_slice(mbs)]
-                        W = W[ext_dist.get_my_slice(mbs)]
 
                     # loss
                     E = loss_fn_wrap(Z, T, use_gpu, device)
@@ -1273,7 +893,6 @@ def run():
 
                         # optimizer
                         optimizer.step()
-                        lr_scheduler.step()
 
                     t2 = time_wrap(use_gpu)
                     total_time += t2 - t1
