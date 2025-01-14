@@ -13,8 +13,6 @@ import torch.nn as nn
 import dlrm_data_pytorch as dp
 import optim.rwsadagrad as RowWiseSparseAdagrad
 
-from torch._ops import ops
-from torch.autograd.profiler import record_function
 from torch.utils.tensorboard import SummaryWriter
 
 from quantizations import FP8QuantDequantSTE, FP16QuantDequantSTE
@@ -30,28 +28,26 @@ def time_wrap(use_gpu):
 
 
 def dlrm_wrap(X, lS_o, lS_i, use_gpu, device, ndevices=1):
-    with record_function("DLRM forward"):
-        if use_gpu:  # .cuda()
-            # lS_i can be either a list of tensors or a stacked tensor.
-            # Handle each case below:
-            if ndevices == 1:
-                lS_i = (
-                    [S_i.to(device) for S_i in lS_i]
-                    if isinstance(lS_i, list)
-                    else lS_i.to(device)
-                )
-                lS_o = (
-                    [S_o.to(device) for S_o in lS_o]
-                    if isinstance(lS_o, list)
-                    else lS_o.to(device)
-                )
-        return dlrm(X.to(device), lS_o, lS_i)
+    if use_gpu:  # .cuda()
+        # lS_i can be either a list of tensors or a stacked tensor.
+        # Handle each case below:
+        if ndevices == 1:
+            lS_i = (
+                [S_i.to(device) for S_i in lS_i]
+                if isinstance(lS_i, list)
+                else lS_i.to(device)
+            )
+            lS_o = (
+                [S_o.to(device) for S_o in lS_o]
+                if isinstance(lS_o, list)
+                else lS_o.to(device)
+            )
+    return dlrm(X.to(device), lS_o, lS_i)
 
 
-def loss_fn_wrap(Z, T, use_gpu, device):
-    with record_function("DLRM loss compute"):
-        if args.loss_function == "mse" or args.loss_function == "bce":
-            return dlrm.loss_fn(Z, T.to(device))
+def loss_fn_wrap(Z, T, device):
+    if args.loss_function == "mse" or args.loss_function == "bce":
+        return dlrm.loss_fn(Z, T.to(device))
 
 
 def unpack_batch(b):
@@ -59,6 +55,70 @@ def unpack_batch(b):
 
 
 class DLRM_Net(nn.Module):
+    def __init__(
+        self,
+        m_spa=None,
+        ln_emb=None,
+        ln_bot=None,
+        ln_top=None,
+        arch_interaction_itself=False,
+        sigmoid_bot=-1,
+        sigmoid_top=-1,
+        sync_dense_params=True,
+        loss_threshold=0.0,
+        ndevices=-1,
+        loss_function="bce",
+        dyedims_flag=False,
+        dyedims_options=None,
+        dyqbits_flag=False,
+        dyqbits_options=None,
+    ):
+        super(DLRM_Net, self).__init__()
+
+        if (
+            (m_spa is not None)
+            and (ln_emb is not None)
+            and (ln_bot is not None)
+            and (ln_top is not None)
+        ):
+            # save arguments
+            self.ndevices = ndevices
+            self.output_d = 0
+            self.parallel_model_batch_size = -1
+            self.parallel_model_is_not_prepared = True
+            self.arch_interaction_itself = arch_interaction_itself
+            self.sync_dense_params = sync_dense_params
+            self.loss_threshold = loss_threshold
+            self.loss_function = loss_function
+            self.dyedims_flag = dyedims_flag
+            self.dyedims_options = dyedims_options
+            self.dyqbits_flag = dyqbits_flag
+            self.dyqbits_options = dyqbits_options
+
+            # create operators
+            if ndevices <= 1:
+                self.emb_l, w_list = self.create_emb(m_spa, ln_emb)
+                self.v_W_l = w_list
+                if self.dyedims_flag or self.dyqbits_flag:
+                    self.selector = EdimQbitSelectionNetwork(m_spa, 2*m_spa, len(self.dyedims_options), len(self.dyqbits_options))
+            self.bot_l = self.create_mlp(ln_bot, sigmoid_bot)
+            self.top_l = self.create_mlp(ln_top, sigmoid_top)
+
+            # specify the loss function
+            if self.loss_function == "mse":
+                self.loss_fn = torch.nn.MSELoss(reduction="mean")
+            elif self.loss_function == "bce":
+                self.loss_fn = torch.nn.BCELoss(reduction="mean")
+            elif self.loss_function == "wbce":
+                self.loss_ws = torch.tensor(
+                    np.fromstring(args.loss_weights, dtype=float, sep="-")
+                )
+                self.loss_fn = torch.nn.BCELoss(reduction="none")
+            else:
+                sys.exit(
+                    "ERROR: --loss-function=" + self.loss_function + " is not supported"
+                )
+
     def create_mlp(self, ln, sigmoid_layer):
         layers = nn.ModuleList()
         for i in range(0, ln.size - 1):
@@ -115,82 +175,13 @@ class DLRM_Net(nn.Module):
             emb_l.append(E)
         return emb_l
 
-    def __init__(
-        self,
-        m_spa=None,
-        ln_emb=None,
-        ln_bot=None,
-        ln_top=None,
-        arch_interaction_op=None,
-        arch_interaction_itself=False,
-        sigmoid_bot=-1,
-        sigmoid_top=-1,
-        sync_dense_params=True,
-        loss_threshold=0.0,
-        ndevices=-1,
-        loss_function="bce",
-        dyedims_flag=False,
-        dyedims_options=None,
-        dyqbits_flag=False,
-        dyqbits_options=None,
-    ):
-        super(DLRM_Net, self).__init__()
-
-        if (
-            (m_spa is not None)
-            and (ln_emb is not None)
-            and (ln_bot is not None)
-            and (ln_top is not None)
-            and (arch_interaction_op is not None)
-        ):
-
-            # save arguments
-            self.ndevices = ndevices
-            self.output_d = 0
-            self.parallel_model_batch_size = -1
-            self.parallel_model_is_not_prepared = True
-            self.arch_interaction_op = arch_interaction_op
-            self.arch_interaction_itself = arch_interaction_itself
-            self.sync_dense_params = sync_dense_params
-            self.loss_threshold = loss_threshold
-            self.loss_function = loss_function
-            self.dyedims_flag = dyedims_flag
-            self.dyedims_options = dyedims_options
-            self.dyqbits_flag = dyqbits_flag
-            self.dyqbits_options = dyqbits_options
-
-            # create operators
-            if ndevices <= 1:
-                self.emb_l, w_list = self.create_emb(m_spa, ln_emb)
-                self.v_W_l = w_list
-                if self.dyedims_flag or self.dyqbits_flag:
-                    self.selector = EdimQbitSelectionNetwork(m_spa, 2*m_spa, len(self.dyedims_options), len(self.dyqbits_options))
-            self.bot_l = self.create_mlp(ln_bot, sigmoid_bot)
-            self.top_l = self.create_mlp(ln_top, sigmoid_top)
-
-            # specify the loss function
-            if self.loss_function == "mse":
-                self.loss_fn = torch.nn.MSELoss(reduction="mean")
-            elif self.loss_function == "bce":
-                self.loss_fn = torch.nn.BCELoss(reduction="mean")
-            elif self.loss_function == "wbce":
-                self.loss_ws = torch.tensor(
-                    np.fromstring(args.loss_weights, dtype=float, sep="-")
-                )
-                self.loss_fn = torch.nn.BCELoss(reduction="none")
-            else:
-                sys.exit(
-                    "ERROR: --loss-function=" + self.loss_function + " is not supported"
-                )
-
     def apply_mlp(self, x, layers):
         return layers(x)
 
     def apply_emb(self, lS_o, lS_i, emb_l, v_W_l):
         # WARNING: notice that we are processing the batch at once. We implicitly
         # assume that the data is laid out such that:
-        # 1. each embedding is indexed with a group of sparse indices,
-        #   corresponding to a single lookup
+        # 1. each embedding is indexed with a group of sparse indices, corresponding to a single lookup
         # 2. for each embedding the lookups are further organized into a batch
         # 3. for a list of embedding tables there is a list of batched lookups
 
@@ -217,42 +208,21 @@ class DLRM_Net(nn.Module):
             )
 
             ly.append(V)
-
         return ly
 
     def interact_features(self, x, ly):
-
-        if self.arch_interaction_op == "dot":
-            # concatenate dense and sparse features
-            (batch_size, d) = x.shape
-            T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
-            # perform a dot product
-            Z = torch.bmm(T, torch.transpose(T, 1, 2))
-            # append dense feature with the interactions (into a row vector)
-            # approach 1: all
-            # Zflat = Z.view((batch_size, -1))
-            # approach 2: unique
-            _, ni, nj = Z.shape
-            # approach 1: tril_indices
-            # offset = 0 if self.arch_interaction_itself else -1
-            # li, lj = torch.tril_indices(ni, nj, offset=offset)
-            # approach 2: custom
-            offset = 1 if self.arch_interaction_itself else 0
-            li = torch.tensor([i for i in range(ni) for j in range(i + offset)])
-            lj = torch.tensor([j for i in range(nj) for j in range(i + offset)])
-            Zflat = Z[:, li, lj]
-            # concatenate dense features and interactions
-            R = torch.cat([x] + [Zflat], dim=1)
-        elif self.arch_interaction_op == "cat":
-            # concatenation features (into a row vector)
-            R = torch.cat([x] + ly, dim=1)
-        else:
-            sys.exit(
-                "ERROR: --arch-interaction-op="
-                + self.arch_interaction_op
-                + " is not supported"
-            )
-
+        # Concatenate dense and sparse features
+        (batch_size, d) = x.shape
+        T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
+        # Perform a dot product
+        Z = torch.bmm(T, torch.transpose(T, 1, 2))
+        _, ni, nj = Z.shape
+        offset = 1 if self.arch_interaction_itself else 0
+        li = torch.tensor([i for i in range(ni) for j in range(i + offset)])
+        lj = torch.tensor([j for i in range(nj) for j in range(i + offset)])
+        Zflat = Z[:, li, lj]
+        # Concatenate dense features and interactions
+        R = torch.cat([x] + [Zflat], dim=1)
         return R
 
     def forward(self, dense_x, lS_o, lS_i):
@@ -267,14 +237,9 @@ class DLRM_Net(nn.Module):
 
         # process dense features (using bottom mlp), resulting in a row vector
         x = self.apply_mlp(dense_x, self.bot_l)
-        # debug prints
-        # print("intermediate")
-        # print(x.detach().cpu().numpy())
 
         # process sparse features(using embeddings), resulting in a list of row vectors
         ly = self.apply_emb(lS_o, lS_i, self.emb_l, self.v_W_l)
-        # for y in ly:
-        #     print(y.detach().cpu().numpy())
 
         # New: reduce dimensions of embeddings
         avg_dims = None
@@ -306,7 +271,6 @@ class DLRM_Net(nn.Module):
 
         # interact features (dense and sparse)
         z = self.interact_features(x, ly)
-        # print(z.detach().cpu().numpy())
 
         # obtain probability of a click (using top mlp)
         p = self.apply_mlp(z, self.top_l)
@@ -344,7 +308,7 @@ def dash_separated_floats(value):
     return value
 
 
-def calculateCompressionRate(args, dlrm, log_iter=-1):
+def calculate_compression_rate(args, dlrm, log_iter=-1):
     #1. Get the selector network from DLRM
     selector = dlrm.selector
 
@@ -379,7 +343,6 @@ def inference(
     args,
     dlrm,
     best_acc_test,
-    best_auc_test,
     test_ld,
     device,
     use_gpu,
@@ -412,16 +375,15 @@ def inference(
         if Z_test.is_cuda:
             torch.cuda.synchronize()
 
-        with record_function("DLRM accuracy compute"):
-            # compute loss and accuracy
-            S_test = Z_test.detach().cpu().numpy()  # numpy array
-            T_test = T_test.detach().cpu().numpy()  # numpy array
+        # compute loss and accuracy
+        S_test = Z_test.detach().cpu().numpy()  # numpy array
+        T_test = T_test.detach().cpu().numpy()  # numpy array
 
-            mbs_test = T_test.shape[0]  # = mini_batch_size except last
-            A_test = np.sum((np.round(S_test, 0) == T_test).astype(np.uint8))
+        mbs_test = T_test.shape[0]  # = mini_batch_size except last
+        A_test = np.sum((np.round(S_test, 0) == T_test).astype(np.uint8))
 
-            test_accu += A_test
-            test_samp += mbs_test
+        test_accu += A_test
+        test_samp += mbs_test
 
     acc_test = test_accu / test_samp
     writer.add_scalar("Test/Acc", acc_test, log_iter)
@@ -453,24 +415,15 @@ def run():
     )
     # model related parameters
     parser.add_argument("--arch-sparse-feature-size", type=int, default=2)
-    parser.add_argument(
-        "--arch-embedding-size", type=dash_separated_ints, default="4-3-2"
-    )
     # j will be replaced with the table number
     parser.add_argument("--arch-mlp-bot", type=dash_separated_ints, default="4-3-2")
     parser.add_argument("--arch-mlp-top", type=dash_separated_ints, default="4-2-1")
-    parser.add_argument(
-        "--arch-interaction-op", type=str, choices=["dot", "cat"], default="dot"
-    )
     parser.add_argument("--arch-interaction-itself", action="store_true", default=False)
-    # activations and loss
-    parser.add_argument("--activation-function", type=str, default="relu")
     parser.add_argument("--loss-function", type=str, default="mse")  # or bce or wbce
     parser.add_argument(
         "--loss-weights", type=dash_separated_floats, default="1.0-1.0"
     )  # for wbce
     parser.add_argument("--loss-threshold", type=float, default=0.0)  # 1.0e-7
-    parser.add_argument("--round-targets", type=bool, default=False)
     # data
     parser.add_argument("--data-size", type=int, default=1)
     parser.add_argument("--num-batches", type=int, default=0)
@@ -480,25 +433,15 @@ def run():
         choices=["random", "dataset", "internal"],
         default="random",
     )  # synthetic, dataset or internal
-    parser.add_argument(
-        "--rand-data-dist", type=str, default="uniform"
-    )  # uniform or gaussian
-    parser.add_argument("--rand-data-min", type=float, default=0)
-    parser.add_argument("--rand-data-max", type=float, default=1)
-    parser.add_argument("--rand-data-mu", type=float, default=-1)
-    parser.add_argument("--rand-data-sigma", type=float, default=1)
-    parser.add_argument("--data-trace-file", type=str, default="./input/dist_emb_j.log")
     parser.add_argument("--data-set", type=str, default="kaggle")  # or terabyte
     parser.add_argument("--raw-data-file", type=str, default="")
     parser.add_argument("--processed-data-file", type=str, default="")
     parser.add_argument("--data-randomize", type=str, default="total")  # or day or none
-    parser.add_argument("--data-trace-enable-padding", type=bool, default=False)
     parser.add_argument("--max-ind-range", type=int, default=-1)
     parser.add_argument("--data-sub-sample-rate", type=float, default=0.0)  # in [0, 1]
     parser.add_argument("--num-indices-per-lookup", type=int, default=10)
     parser.add_argument("--num-indices-per-lookup-fixed", type=bool, default=False)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--memory-map", action="store_true", default=False)
     # training
     parser.add_argument("--mini-batch-size", type=int, default=1)
     parser.add_argument("--nepochs", type=int, default=1)
@@ -507,15 +450,6 @@ def run():
     parser.add_argument("--numpy-rand-seed", type=int, default=123)
     parser.add_argument("--sync-dense-params", type=bool, default=True)
     parser.add_argument("--optimizer", type=str, default="sgd")
-    parser.add_argument(
-        "--dataset-multiprocessing",
-        action="store_true",
-        default=False,
-        help="The Kaggle dataset can be multiprocessed in an environment \
-                        with more than 7 CPU cores and more than 20 GB of memory. \n \
-                        The Terabyte dataset can be multiprocessed in an environment \
-                        with more than 24 CPU cores and at least 1 TB of memory.",
-    )
     # inference
     parser.add_argument("--inference-only", action="store_true", default=False)
     # gpu
@@ -527,9 +461,6 @@ def run():
     parser.add_argument("--test-num-workers", type=int, default=-1)
     parser.add_argument("--print-time", action="store_true", default=False)
     parser.add_argument("--print-wall-time", action="store_true", default=False)
-    parser.add_argument("--debug-mode", action="store_true", default=False)
-    parser.add_argument("--enable-profiling", action="store_true", default=False)
-    parser.add_argument("--plot-compute-graph", action="store_true", default=False)
     parser.add_argument("--tensor-board-filename", type=str, default="run_kaggle_pt")
     # store/load model
     parser.add_argument("--save-model", type=str, default="")
@@ -545,9 +476,6 @@ def run():
     parser.add_argument("--dyqbits-options", type=str, default="32,16,8")
     parser.add_argument("--dyqbits-loss-temp", type=float, default=1.0)
 
-    parser.add_argument("--lr-selector", type=float, default=0.01)
-    parser.add_argument("--load-model-v2", type=str, default="")
-
     global args
     global nbatches
     global nbatches_test
@@ -557,24 +485,15 @@ def run():
     args.dyedims_options = list(map(int, args.dyedims_options.split(",")))
     args.dyqbits_options = list(map(int, args.dyqbits_options.split(",")))
 
-    if args.dataset_multiprocessing:
-        assert sys.version_info[0] >= 3 and sys.version_info[1] > 7, (
-            "The dataset_multiprocessing "
-            + "flag is susceptible to a bug in Python 3.7 and under. "
-            + "https://github.com/facebookresearch/dlrm/issues/172"
-        )
-
-    ### some basic setup ###
+    # Setup seeds
     np.random.seed(args.numpy_rand_seed)
     np.set_printoptions(precision=args.print_precision)
     torch.set_printoptions(precision=args.print_precision)
     torch.manual_seed(args.numpy_rand_seed)
 
     if args.test_mini_batch_size < 0:
-        # if the parameter is not set, use the training batch size
         args.test_mini_batch_size = args.mini_batch_size
     if args.test_num_workers < 0:
-        # if the parameter is not set, use the same parameter for training
         args.test_num_workers = args.num_workers
 
     use_gpu = args.use_gpu and torch.cuda.is_available()
@@ -582,25 +501,23 @@ def run():
     if use_gpu:
         torch.cuda.manual_seed_all(args.numpy_rand_seed)
         torch.backends.cudnn.deterministic = True
-        ngpus = torch.cuda.device_count()
+        ngpus = torch.cuda.device_count()  # Limit the device count with `CUDA_VISIBLE_DEVICES`
         device = torch.device("cuda", 0)
         print("Using {} GPU(s)...".format(ngpus))
     else:
         device = torch.device("cpu")
         print("Using CPU...")
 
-    ### prepare training data ###
+    # Prepare training data
     ln_bot = np.fromstring(args.arch_mlp_bot, dtype=int, sep="-")
-    # input data
 
     if args.data_generation == "dataset":
         train_data, train_ld, test_data, test_ld = dp.make_criteo_data_and_loaders(args)
-        table_feature_map = {idx: idx for idx in range(len(train_data.counts))}
         nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
         nbatches_test = len(test_ld)
 
         ln_emb = train_data.counts
-        # enforce maximum limit on number of vectors per embedding
+        # Enforce maximum limit on number of vectors per embedding
         if args.max_ind_range > 0:
             ln_emb = np.array(
                 list(
@@ -614,41 +531,24 @@ def run():
             ln_emb = np.array(ln_emb)
         m_den = train_data.m_den
         ln_bot[0] = m_den
-    else:
-        # input and target at random
-        ln_emb = np.fromstring(args.arch_embedding_size, dtype=int, sep="-")
-        m_den = ln_bot[0]
-        train_data, train_ld, test_data, test_ld = dp.make_random_data_and_loader(
-            args, ln_emb, m_den
-        )
-        nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
-        nbatches_test = len(test_ld)
 
     args.ln_emb = ln_emb.tolist()
 
-    ### parse command line arguments ###
+    # Parse command line arguments
     m_spa = args.arch_sparse_feature_size
     ln_emb = np.asarray(ln_emb)
     num_fea = ln_emb.size + 1  # num sparse + num dense features
 
     m_den_out = ln_bot[ln_bot.size - 1]
-    if args.arch_interaction_op == "dot":
-        if args.arch_interaction_itself:
-            num_int = (num_fea * (num_fea + 1)) // 2 + m_den_out
-        else:
-            num_int = (num_fea * (num_fea - 1)) // 2 + m_den_out
-    elif args.arch_interaction_op == "cat":
-        num_int = num_fea * m_den_out
+    if args.arch_interaction_itself:
+        num_int = (num_fea * (num_fea + 1)) // 2 + m_den_out
     else:
-        sys.exit(
-            "ERROR: --arch-interaction-op="
-            + args.arch_interaction_op
-            + " is not supported"
-        )
+        num_int = (num_fea * (num_fea - 1)) // 2 + m_den_out
+
     arch_mlp_top_adjusted = str(num_int) + "-" + args.arch_mlp_top
     ln_top = np.fromstring(arch_mlp_top_adjusted, dtype=int, sep="-")
 
-    # sanity check: feature sizes and mlp dimensions must match
+    # Sanity check: feature sizes and mlp dimensions must match
     if m_den != ln_bot[0]:
         sys.exit(
             "ERROR: arch-dense-feature-size "
@@ -674,7 +574,7 @@ def run():
     global ndevices
     ndevices = min(ngpus, args.mini_batch_size, num_fea - 1) if use_gpu else -1
 
-    ### construct the neural network specified above ###
+    # Construct the neural network specified above
     # WARNING: to obtain exactly the same initialization for
     # the weights we need to start from the same random seed.
     # np.random.seed(args.numpy_rand_seed)
@@ -684,7 +584,6 @@ def run():
         ln_emb,
         ln_bot,
         ln_top,
-        arch_interaction_op=args.arch_interaction_op,
         arch_interaction_itself=args.arch_interaction_itself,
         sigmoid_bot=-1,
         sigmoid_top=ln_top.size - 2,
@@ -699,27 +598,21 @@ def run():
     )
 
     if use_gpu:
-        dlrm = dlrm.to(device)  # .cuda()
+        dlrm = dlrm.to(device)
 
+    # Setup the optimizer
     if not args.inference_only:
         if use_gpu and args.optimizer in ["rwsadagrad", "adagrad"]:
             sys.exit("GPU version of Adagrad is not supported by PyTorch.")
-        # specify the optimizer algorithm
         opts = {
             "sgd": torch.optim.SGD,
             "rwsadagrad": RowWiseSparseAdagrad.RWSAdagrad,
             "adagrad": torch.optim.Adagrad,
         }
-
         optimizer = opts[args.optimizer](dlrm.parameters(), lr=args.learning_rate)
 
-    ### main loop ###
-
-    # training or inference
+    # Training or inference
     best_acc_test = 0
-    best_auc_test = 0
-    skip_upto_epoch = 0
-    skip_upto_batch = 0
     total_time = 0
     total_loss = 0
     total_dyedims_loss = 0
@@ -727,202 +620,173 @@ def run():
     total_iter = 0
     total_samp = 0
 
-    # Load model v2 is specified
-    if not (args.load_model_v2 == ""):
-        print("Loading saved model v2 {}".format(args.load_model_v2))
-        if use_gpu:
-            ld_model = torch.load(
-                args.load_model_v2,
-                map_location=torch.device("cuda"),
-                # map_location=lambda storage, loc: storage.cuda(0)
-            )
-        else:
-            # when targeting inference on CPU
-            ld_model = torch.load(args.load_model_v2, map_location=torch.device("cpu"))
+    # Load model is specified
+    if not (args.load_model == ""):
+        print("Loading saved model {}".format(args.load_model))
+        ld_model = torch.load(args.load_model, map_location=device) # device is also defined before based on the use_gpu arg
         dlrm.load_state_dict(ld_model["state_dict"], strict=False)
-        # Freeze weights with parameter names starting with "emb"
+        # Freeze embedding weights
         for name, param in dlrm.named_parameters():
             if name.startswith("emb"):
                 param.requires_grad = False
 
-    print("time/loss/accuracy (if enabled):")
+    print("Time/Loss/Accuracy (if enabled):")
 
-    tb_file = "./" + args.tensor_board_filename
-    writer = SummaryWriter(tb_file)
+    writer = SummaryWriter("./" + args.tensor_board_filename)
 
-    with torch.autograd.profiler.profile(
-        args.enable_profiling, use_cuda=use_gpu, record_shapes=True
-    ) as prof:
-        if not args.inference_only:
-            k = 0
-            total_time_begin = 0
-            while k < args.nepochs:
+    if not args.inference_only:
+        k = 0
+        while k < args.nepochs:
+            for j, inputBatch in enumerate(train_ld):
 
-                if k < skip_upto_epoch:
-                    continue
+                X, lS_o, lS_i, T, W, CBPP = unpack_batch(inputBatch)
 
-                for j, inputBatch in enumerate(train_ld):
-                    if j < skip_upto_batch:
-                        continue
+                t1 = time_wrap(use_gpu)
 
-                    X, lS_o, lS_i, T, W, CBPP = unpack_batch(inputBatch)
+                # Early exit if nbatches was set by the user and has been exceeded
+                if nbatches > 0 and j >= nbatches:
+                    break
 
-                    t1 = time_wrap(use_gpu)
+                mbs = T.shape[0]  # = args.mini_batch_size except maybe for last
 
-                    # early exit if nbatches was set by the user and has been exceeded
-                    if nbatches > 0 and j >= nbatches:
-                        break
+                # Forward pass
+                Z, avg_dims, avg_bits = dlrm_wrap(
+                    X,
+                    lS_o,
+                    lS_i,
+                    use_gpu,
+                    device,
+                    ndevices=ndevices,
+                )
 
-                    mbs = T.shape[0]  # = args.mini_batch_size except maybe for last
+                # Loss
+                E = loss_fn_wrap(Z, T, device)
+                if args.dyedims_flag:
+                    E += args.dyedims_loss_temp * avg_dims
+                if args.dyqbits_flag:
+                    E += args.dyqbits_loss_temp * avg_bits
 
-                    # forward pass
-                    Z, avg_dims, avg_bits = dlrm_wrap(
-                        X,
-                        lS_o,
-                        lS_i,
-                        use_gpu,
+                # Dump loss values
+                L = E.detach().cpu().numpy()  # numpy array
+                if args.dyedims_flag:
+                    L1 = (args.dyedims_loss_temp * avg_dims).detach().cpu().numpy()
+                if args.dyqbits_flag:
+                    L2 = (args.dyqbits_loss_temp * avg_bits).detach().cpu().numpy()
+
+                # Backward pass
+                optimizer.zero_grad()
+                E.backward()
+                optimizer.step()
+
+                t2 = time_wrap(use_gpu)
+                total_time += t2 - t1
+
+                # Dump total loss
+                total_loss += L * mbs
+                if args.dyedims_flag:
+                    total_dyedims_loss += L1 * mbs
+                if args.dyqbits_flag:
+                    total_dyqbits_loss += L2 * mbs
+                total_iter += 1
+                total_samp += mbs
+
+                # Print time, loss and accuracy
+                should_print = ((j + 1) % args.print_freq == 0) or (
+                    j + 1 == nbatches
+                )
+                should_test = (
+                    (args.test_freq > 0)
+                    and (args.data_generation in ["dataset", "random"])
+                    and (((j + 1) % args.test_freq == 0) or (j + 1 == nbatches))
+                )
+                if should_print or should_test:
+                    gT = 1000.0 * total_time / total_iter if args.print_time else -1
+                    total_time = 0
+
+                    train_loss = total_loss / total_samp
+                    train_dyedims_loss = total_dyedims_loss / total_samp
+                    train_dyqbits_loss = total_dyqbits_loss / total_samp
+                    total_loss = 0
+                    total_dyedims_loss = 0
+                    total_dyqbits_loss = 0
+
+                    str_run_type = (
+                        "inference" if args.inference_only else "training"
+                    )
+
+                    wall_time = ""
+                    if args.print_wall_time:
+                        wall_time = " ({})".format(time.strftime("%H:%M"))
+
+                    print(
+                        "Finished {} it {}/{} of epoch {}, {:.2f} ms/it,".format(
+                            str_run_type, j + 1, nbatches, k, gT
+                        )
+                        + " loss {:.6f},".format(train_loss)
+                        + " dyedims loss {:.6f}".format(train_dyedims_loss)
+                        + " dyqbits loss {:.6f}".format(train_dyqbits_loss)
+                        + wall_time,
+                        flush=True,
+                    )
+
+                    log_iter = nbatches * k + j + 1
+                    writer.add_scalar("Train/Loss", train_loss, log_iter)
+                    if args.dyedims_flag:
+                        writer.add_scalar("Train/DyEDimsLoss", train_dyedims_loss, log_iter)
+                    if args.dyqbits_flag:
+                        writer.add_scalar("Train/DyQBitsLoss", train_dyqbits_loss, log_iter)
+
+                    # Check gradient values in tensorboard
+                    # for name, param in dlrm.selector.named_parameters():
+                    #     if param.grad is not None:
+                    #         writer.add_histogram(f"{name}.grad", param.grad, log_iter)
+
+                    total_iter = 0
+                    total_samp = 0
+
+                # Test
+                if should_test:
+                    print("Testing at - {}/{} of epoch {},".format(j + 1, nbatches, k))
+                    model_metrics_dict, is_best = inference(
+                        args,
+                        dlrm,
+                        best_acc_test,
+                        test_ld,
                         device,
-                        ndevices=ndevices,
+                        use_gpu,
+                        log_iter,
                     )
+                    if is_best:
+                        best_acc_test = model_metrics_dict["test_acc"]
 
-                    # loss
-                    E = loss_fn_wrap(Z, T, use_gpu, device)
-                    if args.dyedims_flag:
-                        E += args.dyedims_loss_temp * avg_dims
-                    if args.dyqbits_flag:
-                        E += args.dyqbits_loss_temp * avg_bits
+                    # Calculate the overall compression rate
+                    if args.dyedims_flag or args.dyqbits_flag:
+                        calculate_compression_rate(args, dlrm, log_iter)
 
-                    # compute loss and accuracy
-                    L = E.detach().cpu().numpy()  # numpy array
-                    if args.dyedims_flag:
-                        L1 = (args.dyedims_loss_temp * avg_dims).detach().cpu().numpy()
-                    if args.dyqbits_flag:
-                        L2 = (args.dyqbits_loss_temp * avg_bits).detach().cpu().numpy()
-
-                    with record_function("DLRM backward"):
-                        # scaled error gradient propagation
-                        # (where we do not accumulate gradients across mini-batches)
-                        optimizer.zero_grad()
-                        # backward pass
-                        E.backward()
-
-                        # optimizer
-                        optimizer.step()
-
-                    t2 = time_wrap(use_gpu)
-                    total_time += t2 - t1
-
-                    total_loss += L * mbs
-                    if args.dyedims_flag:
-                        total_dyedims_loss += L1 * mbs
-                    if args.dyqbits_flag:
-                        total_dyqbits_loss += L2 * mbs
-                    total_iter += 1
-                    total_samp += mbs
-
-                    should_print = ((j + 1) % args.print_freq == 0) or (
-                        j + 1 == nbatches
-                    )
-                    should_test = (
-                        (args.test_freq > 0)
-                        and (args.data_generation in ["dataset", "random"])
-                        and (((j + 1) % args.test_freq == 0) or (j + 1 == nbatches))
-                    )
-
-                    # print time, loss and accuracy
-                    if should_print or should_test:
-                        gT = 1000.0 * total_time / total_iter if args.print_time else -1
-                        total_time = 0
-
-                        train_loss = total_loss / total_samp
-                        train_dyedims_loss = total_dyedims_loss / total_samp
-                        train_dyqbits_loss = total_dyqbits_loss / total_samp
-                        total_loss = 0
-                        total_dyedims_loss = 0
-                        total_dyqbits_loss = 0
-
-                        str_run_type = (
-                            "inference" if args.inference_only else "training"
+                    if (is_best
+                        and not (args.save_model == "")
+                        and not args.inference_only
+                    ):
+                        model_metrics_dict["epoch"] = k
+                        model_metrics_dict["iter"] = j + 1
+                        model_metrics_dict["train_loss"] = train_loss
+                        model_metrics_dict["total_loss"] = total_loss
+                        model_metrics_dict["opt_state_dict"] = (
+                            optimizer.state_dict()
                         )
-
-                        wall_time = ""
-                        if args.print_wall_time:
-                            wall_time = " ({})".format(time.strftime("%H:%M"))
-
-                        print(
-                            "Finished {} it {}/{} of epoch {}, {:.2f} ms/it,".format(
-                                str_run_type, j + 1, nbatches, k, gT
-                            )
-                            + " loss {:.6f},".format(train_loss)
-                            + " dyedims loss {:.6f}".format(train_dyedims_loss)
-                            + " dyqbits loss {:.6f}".format(train_dyqbits_loss)
-                            + wall_time,
-                            flush=True,
-                        )
-
-                        log_iter = nbatches * k + j + 1
-                        writer.add_scalar("Train/Loss", train_loss, log_iter)
-                        if args.dyedims_flag:
-                            writer.add_scalar("Train/DyEDimsLoss", train_dyedims_loss, log_iter)
-                        if args.dyqbits_flag:
-                            writer.add_scalar("Train/DyQBitsLoss", train_dyqbits_loss, log_iter)
-
-                        # for name, param in dlrm.selector.named_parameters():
-                        #     if param.grad is not None:
-                        #         writer.add_histogram(f"{name}.grad", param.grad, log_iter)
-
-                        total_iter = 0
-                        total_samp = 0
-
-                    # testing
-                    if should_test:
-                        print(
-                            "Testing at - {}/{} of epoch {},".format(j + 1, nbatches, k)
-                        )
-                        model_metrics_dict, is_best = inference(
-                            args,
-                            dlrm,
-                            best_acc_test,
-                            best_auc_test,
-                            test_ld,
-                            device,
-                            use_gpu,
-                            log_iter,
-                        )
-                        if is_best:
-                            best_acc_test = model_metrics_dict["test_acc"]
-
-                        # Calculate the overall compression rate
-                        if args.dyedims_flag or args.dyqbits_flag:
-                            calculateCompressionRate(args, dlrm, log_iter)
-
-                        if (
-                            is_best
-                            and not (args.save_model == "")
-                            and not args.inference_only
-                        ):
-                            model_metrics_dict["epoch"] = k
-                            model_metrics_dict["iter"] = j + 1
-                            model_metrics_dict["train_loss"] = train_loss
-                            model_metrics_dict["total_loss"] = total_loss
-                            model_metrics_dict["opt_state_dict"] = (
-                                optimizer.state_dict()
-                            )
-                            print("Saving model to {}".format(args.save_model+".epoch{}.iter{}".format(k, j+1)))
-                            torch.save(model_metrics_dict, args.save_model+".epoch{}.iter{}".format(k, j+1))
-
-                k += 1
-        else:
-            print("Testing for inference only")
-            inference(
-                args,
-                dlrm,
-                best_acc_test,
-                best_auc_test,
-                test_ld,
-                device,
-                use_gpu,
-            )
+                        print("Saving model to {}".format(args.save_model+".epoch{}.iter{}".format(k, j+1)))
+                        torch.save(model_metrics_dict, args.save_model+".epoch{}.iter{}".format(k, j+1))
+            k += 1
+    else:
+        print("Testing for inference only")
+        inference(
+            args,
+            dlrm,
+            best_acc_test,
+            test_ld,
+            device,
+            use_gpu,
+        )
 
 if __name__ == "__main__":
     run()
